@@ -47,6 +47,13 @@ type Stroke = {
   color: string;
 };
 
+type SavedStrokeRow = {
+  points_json: string;
+  width: number;
+  color: string;
+  is_eraser: number;
+};
+
 type GameProject = {
   id: string;
   name: string;
@@ -391,7 +398,11 @@ function AppContent() {
         {/* This is the big background area behind the menu and symbol panels.
             Think of it like the tabletop or game mat. Right now it's just a placeholder.
             The rest of the UI sits on top of it. */}
-        <DrawingCanvas bottomInset={0}/>
+        <DrawingCanvas
+          key={activeProjectId ?? 'no-project'}
+          bottomInset={0}
+          surfaceId={activeProjectId ? `${activeProjectId}-board` : undefined}
+        />
 
         {/* A colored status bar at the top of the screen to avoid the content feeling
             cut off behind the device notch or notch-safe area. */}
@@ -767,10 +778,14 @@ function pointsToPath(points: Point[]) {
 function DrawingCanvas({
     bottomInset,
     transparentBackground = false,
+    surfaceId,
   }: {
     bottomInset: number;
     transparentBackground?: boolean;
+    surfaceId?: string;
   }) {
+
+  const db = useSQLiteContext();
   // lineWidth controls stroke thickness for the pen tool.
   const [lineWidth, setLineWidth] = useState(4);
 
@@ -803,6 +818,43 @@ function DrawingCanvas({
   const [colorPickerTarget, setColorPickerTarget] =
     useState<'background' | 'pen' | null>(null);
 
+  useEffect(() => {
+    if (!surfaceId) return;
+
+    let cancelled = false;
+
+    const loadBoard = async () => {
+      try {
+        const rows = await db.getAllAsync<SavedStrokeRow>(
+          `SELECT points_json, width, color, is_eraser
+          FROM strokes
+          WHERE surface_id = ?
+          ORDER BY order_index ASC`,
+          surfaceId
+        );
+
+        if (!cancelled) {
+          setStrokes(
+            rows.map((row) => ({
+              points: JSON.parse(row.points_json) as Point[],
+              width: row.width,
+              color: row.color,
+              eraser: row.is_eraser === 1,
+            }))
+          );
+        }
+      } catch (error) {
+        console.error('Could not load board strokes:', error);
+      }
+    };
+
+    void loadBoard();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [db, surfaceId]);
+
   // finishStroke saves the current draft as a finalized stroke when the user lifts their finger.
   // We only save it if it has more than one point, because a single tap would otherwise create
   // a tiny meaningless mark.
@@ -811,12 +863,34 @@ function DrawingCanvas({
 
     if (finished && finished.points.length > 1) {
       setStrokes((current) => [...current, finished]);
+
+      if (surfaceId) {
+        void db.runAsync(
+          `INSERT INTO strokes
+            (surface_id, points_json, width, color, is_eraser, order_index)
+          VALUES (
+            ?, ?, ?, ?, ?,
+            COALESCE(
+              (SELECT MAX(order_index) + 1 FROM strokes WHERE surface_id = ?),
+              0
+            )
+          )`,
+          surfaceId,
+          JSON.stringify(finished.points),
+          finished.width,
+          finished.color,
+          finished.eraser ? 1 : 0,
+          surfaceId
+        ).catch((error) => {
+          console.error('Could not save board stroke:', error);
+        });
+      }
     }
 
     draftRef.current = null;
     setDraft(null);
     setEraserPosition(null);
-  }, []);
+  }, [db, surfaceId]);
 
   const [boardOffset, setBoardOffset] = useState({ x: 0, y: 0 });
   const boardOffsetRef = useRef({ x: 0, y: 0 });
