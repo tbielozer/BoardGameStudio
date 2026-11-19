@@ -1,11 +1,16 @@
-import { Alert, Modal, Pressable, StyleSheet, ScrollView, Text, TextInput, View, useWindowDimensions } from 'react-native';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Alert, Modal, Pressable, ScrollView, Text, TextInput, View, useWindowDimensions } from 'react-native';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Canvas, Path, Skia, Circle, Group  } from '@shopify/react-native-skia';
-import Slider from '@react-native-community/slider';
-import { GestureHandlerRootView, GestureDetector, usePanGesture, useSimultaneousGestures, usePinchGesture } from 'react-native-gesture-handler';
-import ColorPicker, { BrightnessSlider, Panel3, Preview } from 'reanimated-color-picker';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SQLiteProvider, useSQLiteContext, type SQLiteDatabase } from 'expo-sqlite';
+import type { Stroke } from './types';
+import { DrawingCanvas, type BoardDieVisual, type BoardTileDeckPlacement, type BoardTileVisual, type BoardTokenSupply, type DrawingCanvasHandle } from './DrawingCanvas';
+import { CardEditor } from './CardEditor';
+import { TileEditor } from './TileEditor';
+import { TokenEditor } from './TokenEditor';
+import { DiceEditor } from './DiceEditor';
+import { GameplayPanel, type GameplayPanelHandle } from './GameplayPanel';
+import { styles } from './styles';
 
 // This file is the main screen for the app.
 // It controls which screen the user sees, manages custom symbols, and creates the
@@ -15,7 +20,7 @@ import { SQLiteProvider, useSQLiteContext, type SQLiteDatabase } from 'expo-sqli
 // 2) the main App component
 // 3) AppContent where the app state lives
 // 4) the JSX that renders the screens
-// 5) the style objects at the bottom
+// 5) styles.ts for the visual design
 
 // These are the only screen names this app knows about right now.
 // Think of these as the "pages" in the app.
@@ -24,6 +29,10 @@ type AppScreen =
   | 'createGame' 
   | 'symbolLibrary'
   | 'symbolEditor'
+  | 'cardEditor'
+  | 'tileEditor'
+  | 'tokenEditor'
+  | 'diceEditor'
   | 'projectPicker';
 
 // A custom symbol is just a simple object with:
@@ -35,24 +44,55 @@ type SymbolItem = {
   name: string;
 };
 
-type Point = {
-  x: number;
-  y: number;
+type DeckSpotSetup = {
+  spotType: 'deck' | 'discard';
+  deckId: number | null;
+  faceUp: boolean;
 };
 
-type Stroke = {
-  points: Point[];
-  width: number;
-  eraser: boolean;
-  color: string;
+type DeckSpotDeckOption = {
+  id: number;
+  name: string;
+  card_count: number;
 };
 
-type SavedStrokeRow = {
-  points_json: string;
-  width: number;
+type TileVisualOption = {
+  id: number;
+  name: string;
+  shape: 'hexagon' | 'square' | 'triangle' | 'circle';
+  width_inches: number;
+  height_inches: number;
   color: string;
-  is_eraser: number;
+  surface_id: string;
+  back_surface_id: string | null;
 };
+
+type TileDeckPlacementOption = {
+  id: number;
+  name: string;
+  tile_count: number;
+  top_tile_id: number | null;
+  top_tile_name: string | null;
+  top_tile_shape: TileVisualOption['shape'] | null;
+  top_tile_width: number | null;
+  top_tile_height: number | null;
+  top_tile_color: string | null;
+  top_tile_surface_id: string | null;
+  top_tile_back_surface_id: string | null;
+};
+
+type TokenSupplyOption = {
+  id: number;
+  name: string;
+  shape: BoardTileVisual['shape'];
+  width_inches: number;
+  height_inches: number;
+  color: string;
+  surface_id: string;
+  back_surface_id: string | null;
+};
+
+type DiePlacementOption = BoardDieVisual;
 
 type GameProject = {
   id: string;
@@ -87,6 +127,8 @@ async function initializeDatabase(db: SQLiteDatabase) {
       kind TEXT NOT NULL,
       name TEXT NOT NULL,
       background_color TEXT,
+      background_image_data TEXT,
+      background_image_mime_type TEXT,
       FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
     );
 
@@ -98,11 +140,568 @@ async function initializeDatabase(db: SQLiteDatabase) {
       color TEXT NOT NULL,
       is_eraser INTEGER NOT NULL DEFAULT 0,
       order_index INTEGER NOT NULL,
+      group_id TEXT,
       FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE
     );
+
+    -- Symbols belong to the user's shared library, not to an individual project.
+    CREATE TABLE IF NOT EXISTS symbols (
+      id INTEGER PRIMARY KEY NOT NULL,
+      name TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS symbol_strokes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      symbol_id INTEGER NOT NULL,
+      points_json TEXT NOT NULL,
+      width REAL NOT NULL,
+      color TEXT NOT NULL,
+      is_eraser INTEGER NOT NULL DEFAULT 0,
+      order_index INTEGER NOT NULL,
+      FOREIGN KEY (symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+    );
+
+    -- A saved card owns a dedicated drawing surface, so each card keeps its
+    -- artwork and background separate while belonging to one project.
+    CREATE TABLE IF NOT EXISTS cards (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      surface_id TEXT NOT NULL UNIQUE,
+      back_surface_id TEXT UNIQUE,
+      name TEXT NOT NULL,
+      width_inches REAL NOT NULL DEFAULT 2.5,
+      height_inches REAL NOT NULL DEFAULT 3.5,
+      preview_scale REAL NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS card_images (
+      card_id INTEGER PRIMARY KEY NOT NULL,
+      base64_data TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS surface_images (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      surface_id TEXT NOT NULL,
+      base64_data TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      center_x REAL NOT NULL,
+      center_y REAL NOT NULL,
+      width REAL NOT NULL,
+      height REAL NOT NULL,
+      order_index INTEGER NOT NULL,
+      legacy_card_id INTEGER UNIQUE,
+      FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE,
+      FOREIGN KEY (legacy_card_id) REFERENCES card_images(card_id) ON DELETE CASCADE
+    );
+
+    -- Deck and discard markers are points on the board with a saved facing.
+    CREATE TABLE IF NOT EXISTS deck_spots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      surface_id TEXT NOT NULL,
+      x REAL NOT NULL,
+      y REAL NOT NULL,
+      orientation REAL NOT NULL DEFAULT 0,
+      spot_type TEXT NOT NULL CHECK (spot_type IN ('deck', 'discard')),
+      deck_id INTEGER,
+      face_up INTEGER NOT NULL DEFAULT 1,
+      FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE
+    );
+
+    -- Tile snap points are simple board anchors: a position and a saved facing.
+    CREATE TABLE IF NOT EXISTS tile_snap_points (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      surface_id TEXT NOT NULL,
+      x REAL NOT NULL,
+      y REAL NOT NULL,
+      orientation REAL NOT NULL DEFAULT 0,
+      FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE
+    );
+
+    -- Tile types and decks belong to one project. Deck items store tile counts.
+    CREATE TABLE IF NOT EXISTS game_tiles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      surface_id TEXT UNIQUE,
+      back_surface_id TEXT UNIQUE,
+      name TEXT NOT NULL,
+      shape TEXT NOT NULL CHECK (shape IN ('hexagon', 'square', 'triangle', 'circle')),
+      width_inches REAL NOT NULL,
+      height_inches REAL NOT NULL,
+      preview_scale REAL NOT NULL DEFAULT 1,
+      color TEXT NOT NULL DEFAULT '#E9C46A',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE
+    );
+
+    -- Reusable tokens keep their editable artwork on a dedicated drawing surface.
+    CREATE TABLE IF NOT EXISTS game_tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      surface_id TEXT NOT NULL UNIQUE,
+      back_surface_id TEXT UNIQUE,
+      name TEXT NOT NULL,
+      shape TEXT NOT NULL CHECK (shape IN ('circle', 'square', 'hexagon', 'triangle')),
+      width_inches REAL NOT NULL,
+      height_inches REAL NOT NULL,
+      preview_scale REAL NOT NULL DEFAULT 1,
+      color TEXT NOT NULL DEFAULT '#E9C46A',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE
+    );
+
+    -- A token supply is a map location with either a finite stock or no limit.
+    CREATE TABLE IF NOT EXISTS token_supply_placements (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      surface_id TEXT NOT NULL,
+      token_id INTEGER NOT NULL,
+      x REAL NOT NULL,
+      y REAL NOT NULL,
+      orientation REAL NOT NULL DEFAULT 0,
+      quantity INTEGER CHECK (quantity IS NULL OR quantity > 0),
+      FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE,
+      FOREIGN KEY (token_id) REFERENCES game_tokens(id) ON DELETE CASCADE
+    );
+
+    -- Individual board tokens are separate from token supplies: they have no
+    -- count badge and can be placed anywhere on the board.
+    CREATE TABLE IF NOT EXISTS token_board_placements (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      surface_id TEXT NOT NULL,
+      token_id INTEGER NOT NULL,
+      x REAL NOT NULL,
+      y REAL NOT NULL,
+      orientation REAL NOT NULL DEFAULT 0,
+      face_up INTEGER NOT NULL DEFAULT 1,
+      FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE,
+      FOREIGN KEY (token_id) REFERENCES game_tokens(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS tile_decks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+
+    -- Back artwork templates can be reused across any project's tiles.
+    CREATE TABLE IF NOT EXISTS saved_tile_backs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      artwork_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    -- Token backs can be saved as templates and reused on other token types.
+    CREATE TABLE IF NOT EXISTS saved_token_backs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      artwork_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    -- A die has its own editable drawing surface for each numbered side.
+    CREATE TABLE IF NOT EXISTS game_dice (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      side_count INTEGER NOT NULL CHECK (side_count BETWEEN 2 AND 100),
+      width_inches REAL NOT NULL DEFAULT 1,
+      height_inches REAL NOT NULL DEFAULT 1,
+      color TEXT NOT NULL DEFAULT '#FFFFFF',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS game_die_faces (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      die_id INTEGER NOT NULL,
+      side_number INTEGER NOT NULL,
+      surface_id TEXT NOT NULL UNIQUE,
+      UNIQUE (die_id, side_number),
+      FOREIGN KEY (die_id) REFERENCES game_dice(id) ON DELETE CASCADE,
+      FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS die_board_placements (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      surface_id TEXT NOT NULL,
+      die_id INTEGER NOT NULL,
+      face_number INTEGER NOT NULL DEFAULT 1,
+      x REAL NOT NULL,
+      y REAL NOT NULL,
+      orientation REAL NOT NULL DEFAULT 0,
+      FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE,
+      FOREIGN KEY (die_id) REFERENCES game_dice(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS tile_deck_items (
+      deck_id INTEGER NOT NULL,
+      tile_id INTEGER NOT NULL,
+      quantity INTEGER NOT NULL CHECK (quantity > 0),
+      PRIMARY KEY (deck_id, tile_id),
+      FOREIGN KEY (deck_id) REFERENCES tile_decks(id) ON DELETE CASCADE,
+      FOREIGN KEY (tile_id) REFERENCES game_tiles(id) ON DELETE CASCADE
+    );
+
+    -- Tile faces and tile decks can be placed on the board as movable objects.
+    CREATE TABLE IF NOT EXISTS tile_board_placements (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      surface_id TEXT NOT NULL,
+      tile_id INTEGER,
+      deck_id INTEGER,
+      x REAL NOT NULL,
+      y REAL NOT NULL,
+      orientation REAL NOT NULL DEFAULT 0,
+      face_up INTEGER NOT NULL DEFAULT 1,
+      CHECK ((tile_id IS NOT NULL AND deck_id IS NULL) OR (tile_id IS NULL AND deck_id IS NOT NULL)),
+      FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE,
+      FOREIGN KEY (tile_id) REFERENCES game_tiles(id) ON DELETE CASCADE,
+      FOREIGN KEY (deck_id) REFERENCES tile_decks(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS card_decks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS card_deck_items (
+      deck_id INTEGER NOT NULL,
+      card_id INTEGER NOT NULL,
+      quantity INTEGER NOT NULL CHECK (quantity > 0),
+      PRIMARY KEY (deck_id, card_id),
+      FOREIGN KEY (deck_id) REFERENCES card_decks(id) ON DELETE CASCADE,
+      FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+    );
+
+    -- A project's play state is separate from the reusable deck recipe. Each
+    -- row represents one physical card copy in a board pile or a player hand.
+    CREATE TABLE IF NOT EXISTS game_players (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      order_index INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS play_initialized_spots (
+      project_id TEXT NOT NULL,
+      spot_id INTEGER NOT NULL,
+      deck_id INTEGER NOT NULL,
+      initialized_at INTEGER NOT NULL,
+      PRIMARY KEY (project_id, spot_id),
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (spot_id) REFERENCES deck_spots(id) ON DELETE CASCADE,
+      FOREIGN KEY (deck_id) REFERENCES card_decks(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS play_card_instances (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      card_id INTEGER NOT NULL,
+      deck_spot_id INTEGER,
+      player_id INTEGER,
+      face_up INTEGER NOT NULL DEFAULT 0,
+      hand_order INTEGER NOT NULL DEFAULT 0,
+      pile_order INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE,
+      FOREIGN KEY (deck_spot_id) REFERENCES deck_spots(id) ON DELETE CASCADE,
+      FOREIGN KEY (player_id) REFERENCES game_players(id) ON DELETE CASCADE
+    );
+
+    -- Named snapshots let a project keep multiple gameplay runs while the board
+    -- setup and reusable deck recipes remain unchanged.
+    CREATE TABLE IF NOT EXISTS gameplay_saves (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      snapshot_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+
+    -- Tiles returned during play are tracked separately from the saved deck
+    -- recipe so Start Fresh can restore the original setup.
+    CREATE TABLE IF NOT EXISTS gameplay_tile_deck_returns (
+      project_id TEXT NOT NULL,
+      deck_id INTEGER NOT NULL,
+      tile_id INTEGER NOT NULL,
+      quantity INTEGER NOT NULL CHECK (quantity > 0),
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (project_id, deck_id, tile_id),
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (deck_id) REFERENCES tile_decks(id) ON DELETE CASCADE,
+      FOREIGN KEY (tile_id) REFERENCES game_tiles(id) ON DELETE CASCADE
+    );
+
+    -- Token returns are also kept in the live game state, leaving supply
+    -- quantities in the board setup untouched when a game is reset.
+    CREATE TABLE IF NOT EXISTS gameplay_token_supply_returns (
+      project_id TEXT NOT NULL,
+      supply_id INTEGER NOT NULL,
+      quantity INTEGER NOT NULL CHECK (quantity > 0),
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (project_id, supply_id),
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (supply_id) REFERENCES token_supply_placements(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS gameplay_token_supply_takes (
+      project_id TEXT NOT NULL,
+      supply_id INTEGER NOT NULL,
+      quantity INTEGER NOT NULL CHECK (quantity > 0),
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (project_id, supply_id),
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (supply_id) REFERENCES token_supply_placements(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS gameplay_tile_deck_takes (
+      project_id TEXT NOT NULL,
+      deck_id INTEGER NOT NULL,
+      tile_id INTEGER NOT NULL,
+      quantity INTEGER NOT NULL CHECK (quantity > 0),
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (project_id, deck_id, tile_id),
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (deck_id) REFERENCES tile_decks(id) ON DELETE CASCADE,
+      FOREIGN KEY (tile_id) REFERENCES game_tiles(id) ON DELETE CASCADE
+    );
+
+    -- Piece transforms and returns belong to a live game, not the reusable
+    -- board layout. Clearing these rows starts the project from its setup again.
+    CREATE TABLE IF NOT EXISTS gameplay_tile_placement_states (
+      project_id TEXT NOT NULL,
+      placement_id INTEGER NOT NULL,
+      x REAL NOT NULL,
+      y REAL NOT NULL,
+      orientation REAL NOT NULL,
+      face_up INTEGER NOT NULL,
+      is_returned INTEGER NOT NULL DEFAULT 0,
+      is_added INTEGER NOT NULL DEFAULT 0,
+      returned_deck_id INTEGER,
+      PRIMARY KEY (project_id, placement_id),
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (placement_id) REFERENCES tile_board_placements(id) ON DELETE CASCADE,
+      FOREIGN KEY (returned_deck_id) REFERENCES tile_decks(id) ON DELETE SET NULL
+    );
+    CREATE TABLE IF NOT EXISTS gameplay_token_placement_states (
+      project_id TEXT NOT NULL,
+      placement_id INTEGER NOT NULL,
+      x REAL NOT NULL,
+      y REAL NOT NULL,
+      orientation REAL NOT NULL,
+      face_up INTEGER NOT NULL,
+      is_returned INTEGER NOT NULL DEFAULT 0,
+      is_added INTEGER NOT NULL DEFAULT 0,
+      returned_supply_id INTEGER,
+      PRIMARY KEY (project_id, placement_id),
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (placement_id) REFERENCES token_board_placements(id) ON DELETE CASCADE,
+      FOREIGN KEY (returned_supply_id) REFERENCES token_supply_placements(id) ON DELETE SET NULL
+    );
+    CREATE TABLE IF NOT EXISTS gameplay_die_placement_states (
+      project_id TEXT NOT NULL,
+      placement_id INTEGER NOT NULL,
+      face_number INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (project_id, placement_id),
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (placement_id) REFERENCES die_board_placements(id) ON DELETE CASCADE
+    );
+
+    -- Saved card backs are reusable across cards and projects. The artwork is
+    -- stored as one JSON snapshot so a template can restore all its layers.
+    CREATE TABLE IF NOT EXISTS saved_card_backs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      artwork_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+
+  // These runtime tables are created in newer schemas. Add their columns to
+  // databases that already had the simpler transform-and-return records.
+  const gameplayTileStateColumns = await db.getAllAsync<{ name: string }>(
+    'PRAGMA table_info(gameplay_tile_placement_states)'
+  );
+  if (!gameplayTileStateColumns.some((column) => column.name === 'is_added')) {
+    await db.execAsync('ALTER TABLE gameplay_tile_placement_states ADD COLUMN is_added INTEGER NOT NULL DEFAULT 0');
+  }
+  const gameplayTokenStateColumns = await db.getAllAsync<{ name: string }>(
+    'PRAGMA table_info(gameplay_token_placement_states)'
+  );
+  if (!gameplayTokenStateColumns.some((column) => column.name === 'is_added')) {
+    await db.execAsync('ALTER TABLE gameplay_token_placement_states ADD COLUMN is_added INTEGER NOT NULL DEFAULT 0');
+  }
+
+  // Existing token libraries only had a front. Add a separate back surface
+  // once so old tokens can be edited on both sides without changing their art.
+  const tokenColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(game_tokens)');
+  if (!tokenColumns.some((column) => column.name === 'back_surface_id')) {
+    await db.execAsync('ALTER TABLE game_tokens ADD COLUMN back_surface_id TEXT');
+  }
+  const tokensWithoutBack = await db.getAllAsync<{
+    id: number; project_id: string; name: string; surface_id: string; color: string;
+  }>('SELECT id, project_id, name, surface_id, color FROM game_tokens WHERE back_surface_id IS NULL');
+  for (const token of tokensWithoutBack) {
+    const backSurfaceId = `${token.surface_id}-back`;
+    await db.runAsync(
+      `INSERT OR IGNORE INTO drawing_surfaces (id, project_id, kind, name, background_color)
+       VALUES (?, ?, 'token', ?, ?)`,
+      backSurfaceId, token.project_id, `${token.name} Back`, token.color
+    );
+    await db.runAsync('UPDATE game_tokens SET back_surface_id = ? WHERE id = ?', backSurfaceId, token.id);
+  }
+
+  // Tiles created by earlier versions may not have their own drawing surface.
+  // Add the optional fields once, then give older tiles a blank surface so they
+  // can be opened in the drawing editor without losing their saved dimensions.
+  const tileColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(game_tiles)');
+  if (!tileColumns.some((column) => column.name === 'surface_id')) {
+    await db.execAsync('ALTER TABLE game_tiles ADD COLUMN surface_id TEXT');
+  }
+  if (!tileColumns.some((column) => column.name === 'preview_scale')) {
+    await db.execAsync('ALTER TABLE game_tiles ADD COLUMN preview_scale REAL NOT NULL DEFAULT 1');
+  }
+  if (!tileColumns.some((column) => column.name === 'back_surface_id')) {
+    await db.execAsync('ALTER TABLE game_tiles ADD COLUMN back_surface_id TEXT');
+  }
+  const tilesWithoutSurface = await db.getAllAsync<{
+    id: number; project_id: string; name: string; color: string; surface_id: string | null;
+  }>('SELECT id, project_id, name, color, surface_id FROM game_tiles WHERE surface_id IS NULL');
+  for (const tile of tilesWithoutSurface) {
+    const surfaceId = `${tile.project_id}-tile-${tile.id}`;
+    await db.runAsync(
+      `INSERT OR IGNORE INTO drawing_surfaces (id, project_id, kind, name, background_color)
+       VALUES (?, ?, 'tile', ?, ?)`,
+      surfaceId, tile.project_id, tile.name, tile.color
+    );
+    await db.runAsync('UPDATE game_tiles SET surface_id = ? WHERE id = ?', surfaceId, tile.id);
+  }
+  const tilesWithoutBack = await db.getAllAsync<{
+    id: number; project_id: string; name: string; surface_id: string; color: string;
+  }>('SELECT id, project_id, name, surface_id, color FROM game_tiles WHERE back_surface_id IS NULL');
+  for (const tile of tilesWithoutBack) {
+    const backSurfaceId = `${tile.surface_id}-back`;
+    await db.runAsync(
+      `INSERT OR IGNORE INTO drawing_surfaces (id, project_id, kind, name, background_color)
+       VALUES (?, ?, 'tile', ?, ?)`,
+      backSurfaceId, tile.project_id, `${tile.name} Back`, tile.color
+    );
+    await db.runAsync('UPDATE game_tiles SET back_surface_id = ? WHERE id = ?', backSurfaceId, tile.id);
+  }
+
+  // Older databases already have a strokes table without group_id. Add the
+  // optional column once so every stroke from one placed symbol can be undone as a unit.
+  const strokeColumns = await db.getAllAsync<{ name: string }>(
+    'PRAGMA table_info(strokes)'
+  );
+  if (!strokeColumns.some((column) => column.name === 'group_id')) {
+    await db.execAsync('ALTER TABLE strokes ADD COLUMN group_id TEXT');
+  }
+
+  // CREATE TABLE does not change an existing table. Add this column separately
+  // so projects created by older app versions can still remember their board color.
+  const drawingSurfaceColumns = await db.getAllAsync<{ name: string }>(
+    'PRAGMA table_info(drawing_surfaces)'
+  );
+  if (!drawingSurfaceColumns.some((column) => column.name === 'background_color')) {
+    await db.execAsync('ALTER TABLE drawing_surfaces ADD COLUMN background_color TEXT');
+  }
+  if (!drawingSurfaceColumns.some((column) => column.name === 'background_image_data')) {
+    await db.execAsync('ALTER TABLE drawing_surfaces ADD COLUMN background_image_data TEXT');
+  }
+  if (!drawingSurfaceColumns.some((column) => column.name === 'background_image_mime_type')) {
+    await db.execAsync('ALTER TABLE drawing_surfaces ADD COLUMN background_image_mime_type TEXT');
+  }
+
+  // Existing markers can be linked to one of the project's saved decks and
+  // remember whether their top card is displayed face up or face down.
+  const deckSpotColumns = await db.getAllAsync<{ name: string }>(
+    'PRAGMA table_info(deck_spots)'
+  );
+  if (!deckSpotColumns.some((column) => column.name === 'deck_id')) {
+    await db.execAsync('ALTER TABLE deck_spots ADD COLUMN deck_id INTEGER');
+  }
+  if (!deckSpotColumns.some((column) => column.name === 'face_up')) {
+    await db.execAsync('ALTER TABLE deck_spots ADD COLUMN face_up INTEGER NOT NULL DEFAULT 1');
+  }
+
+  // Older cards have only a front surface. Give each one a saved back surface
+  // so artwork and imported back images persist independently from the front.
+  const cardColumns = await db.getAllAsync<{ name: string }>(
+    'PRAGMA table_info(cards)'
+  );
+  if (!cardColumns.some((column) => column.name === 'back_surface_id')) {
+    await db.execAsync('ALTER TABLE cards ADD COLUMN back_surface_id TEXT');
+  }
+  const cardsWithoutBack = await db.getAllAsync<{
+    id: number;
+    project_id: string;
+    surface_id: string;
+    name: string;
+  }>(
+    `SELECT id, project_id, surface_id, name
+    FROM cards WHERE back_surface_id IS NULL`
+  );
+  for (const card of cardsWithoutBack) {
+    const backSurfaceId = `${card.surface_id}-back`;
+    await db.withTransactionAsync(async () => {
+      await db.runAsync(
+        `INSERT OR IGNORE INTO drawing_surfaces
+          (id, project_id, kind, name, background_color)
+        VALUES (?, ?, ?, ?, ?)`,
+        backSurfaceId,
+        card.project_id,
+        'card',
+        `${card.name} Back`,
+        '#FFFFFF'
+      );
+      await db.runAsync(
+        'UPDATE cards SET back_surface_id = ? WHERE id = ?',
+        backSurfaceId,
+        card.id
+      );
+    });
+  }
+
+  // Move images from the earlier one-image-per-card format into reusable image
+  // layers. legacy_card_id makes this migration safe to run at every startup.
+  await db.execAsync(`
+    INSERT OR IGNORE INTO surface_images
+      (surface_id, base64_data, mime_type, center_x, center_y, width, height,
+        order_index, legacy_card_id)
+    SELECT cards.surface_id, card_images.base64_data, card_images.mime_type,
+      cards.width_inches / 2, cards.height_inches / 2,
+      cards.width_inches, cards.height_inches, 0, card_images.card_id
+    FROM card_images
+    JOIN cards ON cards.id = card_images.card_id;
   `);
 }
-
 export default function App() {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
@@ -142,18 +741,58 @@ function AppContent() {
   // Example values: 'home', 'createGame', 'symbolLibrary', 'symbolEditor'.
   // setScreen is the function used to change the page.
   const [screen, setScreen] = useState<AppScreen>('home');
+  const [projectPickerMode, setProjectPickerMode] = useState<'create' | 'play'>('create');
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [gameplayDrawFaceUp, setGameplayDrawFaceUp] = useState(false);
+  const [handCardDropRequest, setHandCardDropRequest] = useState<{
+    requestId: number; cardInstanceId: number; absoluteX: number; absoluteY: number;
+  } | null>(null);
+  const gameplayRef = useRef<GameplayPanelHandle | null>(null);
+  const handDropRequestCounterRef = useRef(0);
+  const boardCanvasRef = useRef<DrawingCanvasHandle | null>(null);
+  const notifyGameplayPilesChanged = useCallback(() => {
+    boardCanvasRef.current?.refreshGameplayPiles();
+  }, []);
+  const notifyGameplayStateChanged = useCallback(() => {
+    boardCanvasRef.current?.refreshGameplayState();
+  }, []);
 
   // createMenuOpen controls whether the create-game dropdown menu is visible.
   // This is a true/false state value.
   const [createMenuOpen, setCreateMenuOpen] = useState(false);
 
-  // symbols holds the list of all user-created custom symbols.
-  // It starts empty, and new items are added to the array as the user creates them.
+  // symbols holds the shared custom-symbol library loaded from SQLite on startup.
+  // Creating, renaming, and deleting symbols updates both this list and the database.
   const [symbols, setSymbols] = useState<SymbolItem[]>([]);
 
   // activeSymbolId remembers which symbol is currently selected.
   // This lets the app know which symbol to show in the editor screen.
   const [activeSymbolId, setActiveSymbolId] = useState<number | null>(null);
+  const [isPlacingSymbol, setIsPlacingSymbol] = useState(false);
+  const [pendingSymbolId, setPendingSymbolId] = useState<number | null>(null);
+  const [isEditingSymbols, setIsEditingSymbols] = useState(false);
+  const [pendingDeckSpot, setPendingDeckSpot] = useState<DeckSpotSetup | null>(null);
+  const [deckSpotSetupStep, setDeckSpotSetupStep] = useState<'choice' | 'deck' | 'face' | null>(null);
+  const [deckSpotDeckOptions, setDeckSpotDeckOptions] = useState<DeckSpotDeckOption[]>([]);
+  const [chosenDeckSpotDeckId, setChosenDeckSpotDeckId] = useState<number | null>(null);
+  const [isPlacingTileSnapPoint, setIsPlacingTileSnapPoint] = useState(false);
+  const [tilePlacementMode, setTilePlacementMode] = useState<'tile' | 'deck' | null>(null);
+  const [tilePlacementOptions, setTilePlacementOptions] = useState<TileVisualOption[]>([]);
+  const [diePlacementOptions, setDiePlacementOptions] = useState<DiePlacementOption[]>([]);
+  const [diePlacementPickerOpen, setDiePlacementPickerOpen] = useState(false);
+  const [tileDeckPlacementOptions, setTileDeckPlacementOptions] = useState<TileDeckPlacementOption[]>([]);
+  const [pendingBoardTile, setPendingBoardTile] = useState<BoardTileVisual | null>(null);
+  const [pendingBoardDie, setPendingBoardDie] = useState<BoardDieVisual | null>(null);
+  const [pendingTileDeck, setPendingTileDeck] = useState<BoardTileDeckPlacement | null>(null);
+  const [replacingBoardTileId, setReplacingBoardTileId] = useState<number | null>(null);
+  const [tilePlacementRevision, setTilePlacementRevision] = useState(0);
+  const [tokenSupplySetupStep, setTokenSupplySetupStep] = useState<'token' | 'quantity' | null>(null);
+  const [tokenPlacementKind, setTokenPlacementKind] = useState<'supply' | 'single'>('supply');
+  const [tokenSupplyOptions, setTokenSupplyOptions] = useState<TokenSupplyOption[]>([]);
+  const [chosenSupplyToken, setChosenSupplyToken] = useState<TokenSupplyOption | null>(null);
+  const [supplyQuantityText, setSupplyQuantityText] = useState('10');
+  const [pendingTokenSupply, setPendingTokenSupply] = useState<BoardTokenSupply | null>(null);
+  const [pendingBoardToken, setPendingBoardToken] = useState<BoardTileVisual | null>(null);
 
   // isSymbolPage is a shortcut boolean.
   // It is true whenever the current screen is either the library or editor.
@@ -164,6 +803,9 @@ function AppContent() {
   // If no symbol is selected, this value will be undefined.
   const activeSymbol = symbols.find(
     (symbol) => symbol.id === activeSymbolId
+  );
+  const pendingSymbol = symbols.find(
+    (symbol) => symbol.id === pendingSymbolId
   );
 
   const [symbolCanvasSize, setSymbolCanvasSize] = useState(0);
@@ -181,6 +823,75 @@ function AppContent() {
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [renameProjectId, setRenameProjectId] = useState<string | null>(null);
   const [renameProjectText, setRenameProjectText] = useState('');
+
+  // Symbols are stored in a global library, not under a project ID. Load that shared
+  // library when the app opens so the same symbols appear in every project.
+  const loadSymbols = useCallback(async () => {
+    try {
+      const rows = await db.getAllAsync<SymbolItem>(
+        'SELECT id, name FROM symbols ORDER BY updated_at DESC'
+      );
+      setSymbols(rows);
+    } catch (error) {
+      console.error('Could not load symbols:', error);
+    }
+  }, [db]);
+
+  useEffect(() => {
+    void loadSymbols();
+  }, [loadSymbols]);
+
+  const deleteSymbol = async (symbol: SymbolItem) => {
+    try {
+      // Delete strokes explicitly as well as the symbol row so cleanup does not
+      // depend on a platform's foreign-key configuration.
+      await db.withTransactionAsync(async () => {
+        await db.runAsync(
+          'DELETE FROM symbol_strokes WHERE symbol_id = ?',
+          symbol.id
+        );
+        await db.runAsync(
+          'DELETE FROM symbols WHERE id = ?',
+          symbol.id
+        );
+      });
+
+      setSymbols((current) => current.filter((item) => item.id !== symbol.id));
+      setActiveSymbolId((currentId) =>
+        currentId === symbol.id ? null : currentId
+      );
+    } catch (error) {
+      console.error('Could not delete symbol:', error);
+      Alert.alert('Delete failed', 'The symbol could not be deleted.');
+    }
+  };
+
+  const saveSymbolName = async () => {
+    const newName = renameText.trim();
+
+    if (newName.length === 0 || renameSymbolId === null) {
+      return;
+    }
+
+    try {
+      await db.runAsync(
+        'UPDATE symbols SET name = ?, updated_at = ? WHERE id = ?',
+        newName,
+        Date.now(),
+        renameSymbolId
+      );
+
+      setSymbols((current) => current.map((symbol) =>
+        symbol.id === renameSymbolId
+          ? { ...symbol, name: newName }
+          : symbol
+      ));
+      setRenameSymbolId(null);
+    } catch (error) {
+      console.error('Could not rename symbol:', error);
+      Alert.alert('Rename failed', 'The symbol name could not be saved.');
+    }
+  };
 
   const loadProjects = useCallback(async () => {
     try {
@@ -257,17 +968,306 @@ function AppContent() {
     }
   };
 
+  const beginDeckSpotPlacement = () => {
+    setPendingTokenSupply(null);
+    setPendingBoardTile(null);
+    setPendingTileDeck(null);
+    setPendingDeckSpot(null);
+    setChosenDeckSpotDeckId(null);
+    setDeckSpotSetupStep('choice');
+  };
+
+  const chooseSavedDeckForSpot = async () => {
+    if (!activeProjectId) {
+      setDeckSpotDeckOptions([]);
+      setDeckSpotSetupStep('deck');
+      return;
+    }
+    try {
+      const availableDecks = await db.getAllAsync<DeckSpotDeckOption>(
+        `SELECT d.id, d.name, SUM(i.quantity) AS card_count
+        FROM card_decks d
+        JOIN card_deck_items i ON i.deck_id = d.id AND i.quantity > 0
+        WHERE d.project_id = ?
+        GROUP BY d.id, d.name
+        ORDER BY d.updated_at DESC`,
+        activeProjectId
+      );
+      setDeckSpotDeckOptions(availableDecks);
+      setDeckSpotSetupStep('deck');
+    } catch (error) {
+      console.error('Could not load saved decks for a board spot:', error);
+      Alert.alert('Could not load saved decks', 'Please try again.');
+    }
+  };
+
+  const prepareSavedDeckSpot = (faceUp: boolean) => {
+    if (chosenDeckSpotDeckId === null) return;
+    setPendingDeckSpot({
+      spotType: 'deck',
+      deckId: chosenDeckSpotDeckId,
+      faceUp,
+    });
+    setDeckSpotSetupStep(null);
+  };
+
+  const prepareEmptyDeckSpot = () => {
+    setPendingDeckSpot({
+      spotType: 'discard',
+      deckId: null,
+      faceUp: false,
+    });
+    setDeckSpotSetupStep(null);
+  };
+
+  const beginTilePlacement = async (kind: 'tile' | 'deck') => {
+    if (!activeProjectId) {
+      Alert.alert('Choose a project first', 'Tiles and tile decks belong to a project.');
+      return;
+    }
+    try {
+      if (kind === 'tile') {
+        const options = await db.getAllAsync<TileVisualOption>(
+          `SELECT id, name, shape, width_inches, height_inches, color, surface_id, back_surface_id
+           FROM game_tiles WHERE project_id = ? ORDER BY name`,
+          activeProjectId
+        );
+        setTilePlacementOptions(options);
+      } else {
+        const options = await db.getAllAsync<TileDeckPlacementOption>(
+          `SELECT deck.id, deck.name, COALESCE(SUM(item.quantity), 0) AS tile_count,
+            top_tile.id AS top_tile_id, top_tile.name AS top_tile_name,
+            top_tile.shape AS top_tile_shape, top_tile.width_inches AS top_tile_width,
+            top_tile.height_inches AS top_tile_height, top_tile.color AS top_tile_color,
+            top_tile.surface_id AS top_tile_surface_id,
+            top_tile.back_surface_id AS top_tile_back_surface_id
+          FROM tile_decks AS deck
+          LEFT JOIN tile_deck_items AS item ON item.deck_id = deck.id AND item.quantity > 0
+          LEFT JOIN game_tiles AS top_tile ON top_tile.id = (
+            SELECT contents.tile_id FROM tile_deck_items AS contents
+            WHERE contents.deck_id = deck.id AND contents.quantity > 0
+            ORDER BY contents.tile_id LIMIT 1
+          )
+          WHERE deck.project_id = ?
+          GROUP BY deck.id, deck.name, top_tile.id
+          ORDER BY deck.name`,
+          activeProjectId
+        );
+        setTileDeckPlacementOptions(options);
+      }
+      setTilePlacementMode(kind);
+    } catch (error) {
+      console.error(`Could not load ${kind} placement options:`, error);
+      Alert.alert('Could not load tiles', 'Please try again.');
+    }
+  };
+
+  const beginDiePlacement = async () => {
+    if (!activeProjectId) {
+      Alert.alert('Choose a project first', 'Dice belong to a project.');
+      return;
+    }
+    try {
+      const rows = await db.getAllAsync<{
+        id: number; name: string; side_count: number; width_inches: number;
+        height_inches: number; color: string;
+      }>(
+        'SELECT id, name, side_count, width_inches, height_inches, color FROM game_dice WHERE project_id = ? ORDER BY name',
+        activeProjectId
+      );
+      const faceRows = await db.getAllAsync<{ die_id: number; side_number: number; surface_id: string }>(
+        `SELECT face.die_id, face.side_number, face.surface_id
+         FROM game_die_faces AS face JOIN game_dice AS die ON die.id = face.die_id
+         WHERE die.project_id = ? ORDER BY face.die_id, face.side_number`,
+        activeProjectId
+      );
+      const options: BoardDieVisual[] = rows.map((die) => ({
+        id: die.id,
+        name: die.name,
+        sideCount: die.side_count,
+        widthInches: die.width_inches,
+        heightInches: die.height_inches,
+        color: die.color,
+        faces: faceRows.filter((face) => face.die_id === die.id).map((face) => ({
+          sideNumber: face.side_number,
+          surfaceId: face.surface_id,
+        })),
+      }));
+      if (options.length === 0) {
+        Alert.alert('No dice yet', 'Create a die in Dice Editor before placing one.');
+        return;
+      }
+      setDiePlacementOptions(options);
+      setDiePlacementPickerOpen(true);
+    } catch (error) {
+      console.error('Could not load dice for placement:', error);
+      Alert.alert('Could not load dice', 'Please try again.');
+    }
+  };
+
+  const beginTokenSupplyPlacement = async (kind: 'supply' | 'single' = 'supply') => {
+    if (!activeProjectId) {
+      Alert.alert('Choose a project first', 'Token libraries belong to a project.');
+      return;
+    }
+    try {
+      const options = await db.getAllAsync<TokenSupplyOption>(
+        `SELECT id, name, shape, width_inches, height_inches, color, surface_id, back_surface_id
+         FROM game_tokens WHERE project_id = ? ORDER BY name`,
+        activeProjectId
+      );
+      if (options.length === 0) {
+        Alert.alert('No tokens yet', 'Create a token in Token Editor before placing a supply.');
+        return;
+      }
+      setTokenSupplyOptions(options);
+      setChosenSupplyToken(null);
+      setTokenPlacementKind(kind);
+      setTokenSupplySetupStep('token');
+    } catch (error) {
+      console.error('Could not load tokens for map placement:', error);
+      Alert.alert('Could not load tokens', 'Please try again.');
+    }
+  };
+
+  const prepareTokenSupply = (quantity: number | null) => {
+    if (!chosenSupplyToken) return;
+    setPendingTokenSupply({
+      token: {
+        id: chosenSupplyToken.id,
+        name: chosenSupplyToken.name,
+        shape: chosenSupplyToken.shape,
+        widthInches: chosenSupplyToken.width_inches,
+        heightInches: chosenSupplyToken.height_inches,
+        color: chosenSupplyToken.color,
+        frontSurfaceId: chosenSupplyToken.surface_id,
+        backSurfaceId: chosenSupplyToken.back_surface_id,
+      },
+      quantity,
+    });
+    setPendingBoardToken(null);
+    setTokenSupplySetupStep(null);
+    setIsPlacingTileSnapPoint(false);
+    setIsPlacingSymbol(false);
+    setIsEditingSymbols(false);
+    setPendingSymbolId(null);
+    setPendingDeckSpot(null);
+    setPendingBoardTile(null);
+    setPendingTileDeck(null);
+    setReplacingBoardTileId(null);
+  };
+
+  const prepareSingleToken = (token: TokenSupplyOption) => {
+    setPendingBoardToken({
+      id: token.id,
+      name: token.name,
+      shape: token.shape,
+      widthInches: token.width_inches,
+      heightInches: token.height_inches,
+      color: token.color,
+      frontSurfaceId: token.surface_id,
+      backSurfaceId: token.back_surface_id,
+    });
+    setPendingTokenSupply(null);
+    setTokenSupplySetupStep(null);
+    setIsPlacingTileSnapPoint(false);
+    setIsPlacingSymbol(false);
+    setIsEditingSymbols(false);
+    setPendingSymbolId(null);
+    setPendingDeckSpot(null);
+    setPendingBoardTile(null);
+    setPendingTileDeck(null);
+    setReplacingBoardTileId(null);
+  };
+
+  const prepareFiniteTokenSupply = () => {
+    const quantity = Number(supplyQuantityText);
+    if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+      Alert.alert('Enter a valid amount', 'The supply count must be a positive whole number.');
+      return;
+    }
+    prepareTokenSupply(quantity);
+  };
+
+  const startPlacingTile = async (tile: TileVisualOption) => {
+    if (replacingBoardTileId !== null) {
+      try {
+        await db.runAsync(
+          'UPDATE tile_board_placements SET tile_id = ?, deck_id = NULL, face_up = 1 WHERE id = ?',
+          tile.id, replacingBoardTileId
+        );
+        setReplacingBoardTileId(null);
+        setTilePlacementMode(null);
+        setTilePlacementRevision((revision) => revision + 1);
+      } catch (error) {
+        console.error('Could not change the placed tile type:', error);
+        Alert.alert('Could not change tile', 'Please try again.');
+      }
+      return;
+    }
+    setPendingBoardTile({
+      id: tile.id,
+      name: tile.name,
+      shape: tile.shape,
+      widthInches: tile.width_inches,
+      heightInches: tile.height_inches,
+      color: tile.color,
+      frontSurfaceId: tile.surface_id,
+      backSurfaceId: tile.back_surface_id,
+    });
+    setPendingTileDeck(null);
+    setPendingTokenSupply(null);
+    setTilePlacementMode(null);
+    setIsPlacingTileSnapPoint(false);
+    setIsPlacingSymbol(false);
+    setIsEditingSymbols(false);
+    setPendingSymbolId(null);
+    setPendingDeckSpot(null);
+  };
+
+  const startPlacingTileDeck = (deck: TileDeckPlacementOption) => {
+    const topTile = deck.top_tile_id === null || !deck.top_tile_name || !deck.top_tile_shape ||
+      !deck.top_tile_width || !deck.top_tile_height || !deck.top_tile_surface_id
+      ? null
+      : {
+          id: deck.top_tile_id,
+          name: deck.top_tile_name,
+          shape: deck.top_tile_shape,
+          widthInches: deck.top_tile_width,
+          heightInches: deck.top_tile_height,
+          color: deck.top_tile_color ?? '#E9C46A',
+          frontSurfaceId: deck.top_tile_surface_id,
+          backSurfaceId: deck.top_tile_back_surface_id,
+        };
+    setPendingTileDeck({ id: deck.id, name: deck.name, tileCount: deck.tile_count, topTile });
+    setPendingBoardTile(null);
+    setPendingTokenSupply(null);
+    setReplacingBoardTileId(null);
+    setTilePlacementMode(null);
+    setIsPlacingTileSnapPoint(false);
+    setIsPlacingSymbol(false);
+    setIsEditingSymbols(false);
+    setPendingSymbolId(null);
+    setPendingDeckSpot(null);
+  };
+
+  const requestTileTypeChange = (placementId: number) => {
+    setReplacingBoardTileId(placementId);
+    void beginTilePlacement('tile');
+  };
+
   if (screen === 'projectPicker') {
     return (
       <View style={styles.projectPickerScreen}>
-        <Text style={styles.createTitle}>My Projects</Text>
+        <Text style={styles.createTitle}>{projectPickerMode === 'play' ? 'Choose a Game to Play' : 'My Projects'}</Text>
+        {projectPickerMode === 'play' && <Text style={{ color: '#4B5563', marginBottom: 12 }}>Load a saved project to begin gameplay.</Text>}
 
         <ScrollView
           style={styles.projectScroll}
           contentContainerStyle={styles.projectGrid}
         >
           {projects.length === 0 ? (
-            <Text>No projects yet. Create one to get started.</Text>
+            <Text>{projectPickerMode === 'play' ? 'No saved games yet. Create a game first.' : 'No projects yet. Create one to get started.'}</Text>
           ) : (
             projects.map((project) => (
               <View key={project.id} style={styles.projectTile}>
@@ -279,16 +1279,23 @@ function AppContent() {
                   ]}
                   onPress={() => {
                     setActiveProjectId(project.id);
+                    if (projectPickerMode === 'play') {
+                      setCreateMenuOpen(false);
+                      setIsEditingSymbols(false);
+                      setIsPlaying(true);
+                    } else {
+                      setIsPlaying(false);
+                    }
                     setScreen('createGame');
                   }}
                 >
-                  <Text style={styles.projectTileText}>{project.name}</Text>
+                  <Text style={styles.projectTileText}>{projectPickerMode === 'play' ? `Play ${project.name}` : project.name}</Text>
                 </Pressable>
 
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel={`Delete ${project.name}`}
-                  style={styles.projectDeleteButton}
+                  style={[styles.projectDeleteButton, projectPickerMode === 'play' && { display: 'none' }]}
                   onPress={() =>
                     Alert.alert(
                       'Delete project?',
@@ -309,7 +1316,7 @@ function AppContent() {
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel={`Rename ${project.name}`}
-                  style={styles.projectRenameButton}
+                  style={[styles.projectRenameButton, projectPickerMode === 'play' && { display: 'none' }]}
                   onPress={() => {
                     setRenameProjectText(project.name);
                     setRenameProjectId(project.id);
@@ -334,7 +1341,7 @@ function AppContent() {
             <Text style={styles.buttonText}>Back</Text>
           </Pressable>
 
-          <Pressable
+          {projectPickerMode === 'create' && <Pressable
             style={({ pressed }) => [
               styles.button,
               styles.projectActionButton,
@@ -343,7 +1350,7 @@ function AppContent() {
             onPress={createProject}
           >
             <Text style={styles.buttonText}>New Project</Text>
-          </Pressable>
+          </Pressable>}
         </View>
         <Modal
           visible={renameProjectId !== null}
@@ -392,26 +1399,362 @@ function AppContent() {
   // opens the symbol editor or menu overlay.
   // If the user is on the create-game page or on either symbol page, we show the
   // game mat background and overlay panels instead of the main menu.
-  if (screen === 'createGame' || isSymbolPage) {
+  if (screen === 'createGame' || isSymbolPage || screen === 'cardEditor' || screen === 'tileEditor' || screen === 'tokenEditor' || screen === 'diceEditor') {
     return (
       <View style={styles.gameCanvas}>
+        <Modal
+          visible={deckSpotSetupStep !== null}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setDeckSpotSetupStep(null)}
+        >
+          <View style={styles.renameBackdrop}>
+            <View style={styles.renameDialog}>
+              <Text style={styles.menuTitle}>
+                {deckSpotSetupStep === 'choice'
+                  ? 'Add a Deck Spot'
+                  : deckSpotSetupStep === 'deck'
+                    ? 'Choose a Saved Deck'
+                    : 'Show the Top Card'}
+              </Text>
+              {deckSpotSetupStep === 'choice' && (
+                <>
+                  <Pressable
+                    accessibilityRole="button"
+                    style={styles.menuOption}
+                    onPress={() => void chooseSavedDeckForSpot()}
+                  >
+                    <Text>Use a Saved Deck</Text>
+                  </Pressable>
+                  <Pressable
+                    accessibilityRole="button"
+                    style={styles.menuOption}
+                    onPress={prepareEmptyDeckSpot}
+                  >
+                    <Text>Empty Deck / Discard Pile</Text>
+                  </Pressable>
+                </>
+              )}
+              {deckSpotSetupStep === 'deck' && (
+                deckSpotDeckOptions.length === 0 ? (
+                  <Text style={styles.spotSetupHelperText}>
+                    There are no saved decks with cards in this project yet.
+                  </Text>
+                ) : (
+                  <ScrollView style={{ maxHeight: 280 }} keyboardShouldPersistTaps="handled">
+                    {deckSpotDeckOptions.map((deck) => (
+                      <Pressable
+                        key={deck.id}
+                        accessibilityRole="button"
+                        style={styles.menuOption}
+                        onPress={() => {
+                          setChosenDeckSpotDeckId(deck.id);
+                          setDeckSpotSetupStep('face');
+                        }}
+                      >
+                        <Text>{deck.name} · {deck.card_count} cards</Text>
+                      </Pressable>
+                    ))}
+                  </ScrollView>
+                )
+              )}
+              {deckSpotSetupStep === 'face' && (
+                <>
+                  <Text style={styles.spotSetupHelperText}>
+                    Choose which side of the top card to show on the map marker.
+                  </Text>
+                  <Pressable
+                    accessibilityRole="button"
+                    style={styles.menuOption}
+                    onPress={() => prepareSavedDeckSpot(true)}
+                  >
+                    <Text>Face Up · Show the card front</Text>
+                  </Pressable>
+                  <Pressable
+                    accessibilityRole="button"
+                    style={styles.menuOption}
+                    onPress={() => prepareSavedDeckSpot(false)}
+                  >
+                    <Text>Face Down · Show the card back</Text>
+                  </Pressable>
+                </>
+              )}
+              <View style={styles.renameActions}>
+                {deckSpotSetupStep !== 'choice' && (
+                  <Pressable
+                    style={styles.renameActionButton}
+                    onPress={() => setDeckSpotSetupStep(
+                      deckSpotSetupStep === 'face' ? 'deck' : 'choice'
+                    )}
+                  >
+                    <Text>Back</Text>
+                  </Pressable>
+                )}
+                <Pressable
+                  style={styles.renameActionButton}
+                  onPress={() => setDeckSpotSetupStep(null)}
+                >
+                  <Text>Cancel</Text>
+                </Pressable>
+              </View>
+            </View>
+          </View>
+        </Modal>
+        <Modal
+          visible={tilePlacementMode !== null}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setTilePlacementMode(null)}
+        >
+          <View style={styles.renameBackdrop}>
+            <View style={styles.renameDialog}>
+              <Text style={styles.menuTitle}>{tilePlacementMode === 'tile' ? 'Choose a Tile' : 'Choose a Tile Deck'}</Text>
+              {tilePlacementMode === 'tile' && (tilePlacementOptions.length === 0 ? (
+                <Text style={styles.spotSetupHelperText}>Create tile types in Tile Editor before placing them.</Text>
+              ) : <ScrollView style={{ maxHeight: 360 }} keyboardShouldPersistTaps="handled">
+                {tilePlacementOptions.map((tile) => (
+                  <Pressable key={tile.id} style={styles.menuOption} onPress={() => void startPlacingTile(tile)}>
+                    <Text>{tile.name} · {tile.shape} · {tile.width_inches} × {tile.height_inches} in</Text>
+                  </Pressable>
+                ))}
+              </ScrollView>)}
+              {tilePlacementMode === 'deck' && (tileDeckPlacementOptions.length === 0 ? (
+                <Text style={styles.spotSetupHelperText}>Create tile decks in Tile Editor before placing them.</Text>
+              ) : <ScrollView style={{ maxHeight: 360 }} keyboardShouldPersistTaps="handled">
+                {tileDeckPlacementOptions.map((deck) => (
+                  <Pressable key={deck.id} style={styles.menuOption} onPress={() => startPlacingTileDeck(deck)}>
+                    <Text>{deck.name} · {deck.tile_count} tiles</Text>
+                  </Pressable>
+                ))}
+              </ScrollView>)}
+              <View style={styles.renameActions}>
+                <Pressable style={styles.renameActionButton} onPress={() => { setTilePlacementMode(null); setReplacingBoardTileId(null); }}><Text>Cancel</Text></Pressable>
+              </View>
+            </View>
+          </View>
+        </Modal>
+        <Modal
+          visible={tokenSupplySetupStep !== null}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setTokenSupplySetupStep(null)}
+        >
+          <View style={styles.renameBackdrop}>
+            <View style={styles.renameDialog}>
+              <Text style={styles.menuTitle}>{tokenSupplySetupStep === 'token'
+                ? tokenPlacementKind === 'single' ? 'Choose a Token to Place' : 'Choose a Token for Supply'
+                : 'Set Supply Amount'}</Text>
+              {tokenSupplySetupStep === 'token' ? (
+                <ScrollView style={{ maxHeight: 360 }} keyboardShouldPersistTaps="handled">
+                  {tokenSupplyOptions.length === 0 && (
+                    <Text style={styles.spotSetupHelperText}>No tokens are available in this project yet.</Text>
+                  )}
+                  {tokenSupplyOptions.map((token) => (
+                    <Pressable key={token.id} style={styles.tokenSupplyChoice} onPress={() => {
+                      if (tokenPlacementKind === 'single') {
+                        prepareSingleToken(token);
+                        return;
+                      }
+                      setChosenSupplyToken(token);
+                      setSupplyQuantityText('10');
+                      setTokenSupplySetupStep('quantity');
+                    }}>
+                      <Text numberOfLines={1} style={styles.tokenSupplyChoiceName}>{token.name}</Text>
+                      <Text numberOfLines={1} style={styles.tokenSupplyChoiceDetails}>
+                        {token.shape} · {token.width_inches} × {token.height_inches} in
+                      </Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+              ) : (
+                <>
+                  <Text style={styles.spotSetupHelperText}>
+                    {chosenSupplyToken?.name} can have unlimited stock or a fixed number of tokens.
+                  </Text>
+                  <Pressable style={styles.menuOption} onPress={() => prepareTokenSupply(null)}>
+                    <Text>Unlimited Supply</Text>
+                  </Pressable>
+                  <TextInput
+                    style={styles.renameInput}
+                    value={supplyQuantityText}
+                    onChangeText={setSupplyQuantityText}
+                    keyboardType="number-pad"
+                    placeholder="Number of tokens"
+                  />
+                  <Pressable style={styles.menuOption} onPress={prepareFiniteTokenSupply}>
+                    <Text>Place Set Number</Text>
+                  </Pressable>
+                </>
+              )}
+              <View style={styles.renameActions}>
+                {tokenSupplySetupStep === 'quantity' && (
+                  <Pressable style={styles.renameActionButton} onPress={() => setTokenSupplySetupStep('token')}>
+                    <Text>Back</Text>
+                  </Pressable>
+                )}
+                <Pressable style={styles.renameActionButton} onPress={() => setTokenSupplySetupStep(null)}>
+                  <Text>Cancel</Text>
+                </Pressable>
+              </View>
+            </View>
+          </View>
+        </Modal>
+        <Modal
+          visible={diePlacementPickerOpen}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setDiePlacementPickerOpen(false)}
+        >
+          <View style={styles.renameBackdrop}>
+            <View style={styles.renameDialog}>
+              <Text style={styles.menuTitle}>Choose a Die to Place</Text>
+              <ScrollView style={{ maxHeight: 360 }} keyboardShouldPersistTaps="handled">
+                {diePlacementOptions.map((die) => (
+                  <Pressable key={die.id} style={styles.tokenSupplyChoice} onPress={() => {
+                    setPendingBoardDie(die);
+                    setPendingBoardTile(null);
+                    setPendingTileDeck(null);
+                    setPendingTokenSupply(null);
+                    setPendingBoardToken(null);
+                    setPendingDeckSpot(null);
+                    setPendingSymbolId(null);
+                    setIsPlacingTileSnapPoint(false);
+                    setIsPlacingSymbol(false);
+                    setIsEditingSymbols(false);
+                    setDiePlacementPickerOpen(false);
+                  }}>
+                    <Text numberOfLines={1} style={styles.tokenSupplyChoiceName}>{die.name}</Text>
+                    <Text numberOfLines={1} style={styles.tokenSupplyChoiceDetails}>
+                      d{die.sideCount} · {die.widthInches} × {die.heightInches} in per face
+                    </Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+              <View style={styles.renameActions}>
+                <Pressable style={styles.renameActionButton} onPress={() => setDiePlacementPickerOpen(false)}><Text>Cancel</Text></Pressable>
+              </View>
+            </View>
+          </View>
+        </Modal>
         {/* This is the big background area behind the menu and symbol panels.
             Think of it like the tabletop or game mat. Right now it's just a placeholder.
             The rest of the UI sits on top of it. */}
         <DrawingCanvas
+          ref={boardCanvasRef}
           key={activeProjectId ?? 'no-project'}
           bottomInset={0}
+          topInset={insets.top + 5}
           surfaceId={activeProjectId ? `${activeProjectId}-board` : undefined}
+          placementSymbolId={pendingSymbolId ?? undefined}
+          placementSymbolName={pendingSymbol?.name}
+          repeatSymbolPlacement
+          placementDeckSpot={pendingDeckSpot ?? undefined}
+          placementTileSnapPoint={isPlacingTileSnapPoint}
+          placementTile={pendingBoardTile ?? undefined}
+          placementTileDeck={pendingTileDeck ?? undefined}
+          placementTokenSupply={pendingTokenSupply ?? undefined}
+          placementToken={pendingBoardToken ?? undefined}
+          placementDie={pendingBoardDie ?? undefined}
+          tilePlacementRevision={tilePlacementRevision}
+          onSymbolPlaced={() => setPendingSymbolId(null)}
+          onCancelDeckSpotPlacement={() => setPendingDeckSpot(null)}
+          onCancelTileSnapPointPlacement={() => setIsPlacingTileSnapPoint(false)}
+          onCancelTilePlacement={() => { setPendingBoardTile(null); setPendingTileDeck(null); setReplacingBoardTileId(null); }}
+          onCancelTokenSupplyPlacement={() => setPendingTokenSupply(null)}
+          onCancelTokenPlacement={() => setPendingBoardToken(null)}
+          onCancelDiePlacement={() => setPendingBoardDie(null)}
+          onBoardTileTypeChangeRequested={requestTileTypeChange}
+          isEditingSymbols={isEditingSymbols}
+          onStopEditingSymbols={() => setIsEditingSymbols(false)}
+            gameplayMode={isPlaying}
+            gameplayDrawFaceUp={gameplayDrawFaceUp}
+            onDeckCardDragRequest={(sourceSpotId, targetSpotId, absoluteY) => {
+              gameplayRef.current?.resolveDeckCardDrop(sourceSpotId, targetSpotId, absoluteY);
+            }}
+            handCardDropRequest={handCardDropRequest ?? undefined}
+            onHandCardDropResolved={(request, deckSpotId) => {
+              setHandCardDropRequest((current) => current?.requestId === request.requestId ? null : current);
+              gameplayRef.current?.resolveHandCardDrop(request.cardInstanceId, deckSpotId);
+            }}
         />
+
+        {isPlaying && activeProjectId && (
+          <GameplayPanel
+            ref={gameplayRef}
+            projectId={activeProjectId}
+            topInset={insets.top}
+            bottomInset={insets.bottom}
+            drawFaceUp={gameplayDrawFaceUp}
+            onDrawFaceUpChange={setGameplayDrawFaceUp}
+            onClose={() => {
+              setIsPlaying(false);
+              setHandCardDropRequest(null);
+              setCreateMenuOpen(false);
+              setIsEditingSymbols(false);
+              setScreen('home');
+            }}
+            onBoardPilesChanged={notifyGameplayPilesChanged}
+            onGameplayStateChanged={notifyGameplayStateChanged}
+            onHandCardDropRequest={(cardInstanceId, absoluteX, absoluteY) => {
+              handDropRequestCounterRef.current += 1;
+              setHandCardDropRequest({
+                requestId: handDropRequestCounterRef.current,
+                cardInstanceId,
+                absoluteX,
+                absoluteY,
+              });
+            }}
+          />
+        )}
 
         {/* A colored status bar at the top of the screen to avoid the content feeling
             cut off behind the device notch or notch-safe area. */}
         <View pointerEvents="none" style={[styles.topLine, { height: insets.top }]} />
 
+        {screen === 'cardEditor' && (
+          <CardEditor
+            topInset={insets.top}
+            bottomInset={insets.bottom}
+            projectId={activeProjectId ?? undefined}
+            symbols={symbols}
+            onClose={() => setScreen('createGame')}
+          />
+        )}
+
+        {screen === 'tileEditor' && (
+          <TileEditor
+            projectId={activeProjectId ?? undefined}
+            symbols={symbols}
+            topInset={insets.top}
+            bottomInset={insets.bottom}
+            onClose={() => setScreen('createGame')}
+          />
+        )}
+
+        {screen === 'tokenEditor' && (
+          <TokenEditor
+            projectId={activeProjectId ?? undefined}
+            symbols={symbols}
+            topInset={insets.top}
+            bottomInset={insets.bottom}
+            onClose={() => setScreen('createGame')}
+          />
+        )}
+
+        {screen === 'diceEditor' && (
+          <DiceEditor
+            projectId={activeProjectId ?? undefined}
+            symbols={symbols}
+            topInset={insets.top}
+            bottomInset={insets.bottom}
+            onClose={() => setScreen('createGame')}
+          />
+        )}
+
         {/* The game menu appears only while the user is on the create-game screen.
             It is either an open dropdown or a small hamburger button depending on
             whether createMenuOpen is true or false. */}
-        {screen === 'createGame' && (
+        {screen === 'createGame' && !isEditingSymbols && !isPlaying && (
           createMenuOpen ? (
             <View
               style={[
@@ -436,10 +1779,166 @@ function AppContent() {
                 </Pressable>
               </View>
 
+              <ScrollView
+                style={styles.menuOptionsScroll}
+                contentContainerStyle={styles.menuOptionsContent}
+                showsVerticalScrollIndicator
+              >
               <Pressable
                 style={styles.menuOption}
                 onPress={() => {
                   setCreateMenuOpen(false);
+                  boardCanvasRef.current?.importImage();
+                }}
+              >
+                <Text>Add Image</Text>
+              </Pressable>
+
+              <Pressable
+                style={styles.menuOption}
+                onPress={() => {
+                  setCreateMenuOpen(false);
+                  setIsPlacingTileSnapPoint(false);
+                  setPendingTokenSupply(null);
+                  setScreen('tileEditor');
+                }}
+              >
+                <Text>Tile Editor</Text>
+              </Pressable>
+
+              <Pressable
+                style={styles.menuOption}
+                onPress={() => {
+                  setCreateMenuOpen(false);
+                  setIsPlacingTileSnapPoint(false);
+                  setIsPlacingSymbol(false);
+                  setIsEditingSymbols(false);
+                  setPendingSymbolId(null);
+                  setPendingDeckSpot(null);
+                  setPendingBoardTile(null);
+                  setPendingTileDeck(null);
+                  setPendingTokenSupply(null);
+                  setScreen('tokenEditor');
+                }}
+              >
+                <Text>Token Editor</Text>
+              </Pressable>
+
+              <Pressable style={styles.menuOption} onPress={() => {
+                setCreateMenuOpen(false);
+                setPendingBoardDie(null);
+                setPendingBoardTile(null);
+                setPendingTileDeck(null);
+                setPendingTokenSupply(null);
+                setPendingBoardToken(null);
+                setIsPlacingTileSnapPoint(false);
+                setIsPlacingSymbol(false);
+                setIsEditingSymbols(false);
+                setScreen('diceEditor');
+              }}>
+                <Text>Dice Editor</Text>
+              </Pressable>
+
+              <Pressable
+                style={styles.menuOption}
+                onPress={() => {
+                  setCreateMenuOpen(false);
+                  setIsPlacingTileSnapPoint(true);
+                  setPendingTokenSupply(null);
+                  setIsPlacingSymbol(false);
+                  setIsEditingSymbols(false);
+                  setPendingBoardTile(null);
+                  setPendingTileDeck(null);
+                  setPendingSymbolId(null);
+                  setPendingDeckSpot(null);
+                }}
+              >
+                <Text>Place Tile Snap Point</Text>
+              </Pressable>
+
+              <Pressable style={styles.menuOption} onPress={() => {
+                setCreateMenuOpen(false);
+                setIsPlacingTileSnapPoint(false);
+                setIsPlacingSymbol(false);
+                setIsEditingSymbols(false);
+                setReplacingBoardTileId(null);
+                setPendingTileDeck(null);
+                setPendingTokenSupply(null);
+                setPendingSymbolId(null);
+                setPendingDeckSpot(null);
+                void beginTilePlacement('tile');
+              }}>
+                <Text>Place Tile</Text>
+              </Pressable>
+
+              <Pressable style={styles.menuOption} onPress={() => {
+                setCreateMenuOpen(false);
+                setIsPlacingTileSnapPoint(false);
+                setIsPlacingSymbol(false);
+                setIsEditingSymbols(false);
+                setPendingBoardTile(null);
+                setReplacingBoardTileId(null);
+                setPendingTokenSupply(null);
+                setPendingSymbolId(null);
+                setPendingDeckSpot(null);
+                void beginTilePlacement('deck');
+              }}>
+                <Text>Place Tile Deck</Text>
+              </Pressable>
+
+              <Pressable style={styles.menuOption} onPress={() => {
+                setCreateMenuOpen(false);
+                setIsPlacingTileSnapPoint(false);
+                setIsPlacingSymbol(false);
+                setIsEditingSymbols(false);
+                setPendingBoardTile(null);
+                setPendingTileDeck(null);
+                setPendingSymbolId(null);
+                setPendingDeckSpot(null);
+                setPendingTokenSupply(null);
+                void beginTokenSupplyPlacement();
+              }}>
+                <Text>Place Token Supply</Text>
+              </Pressable>
+
+              <Pressable style={styles.menuOption} onPress={() => {
+                setCreateMenuOpen(false);
+                setIsPlacingTileSnapPoint(false);
+                setIsPlacingSymbol(false);
+                setIsEditingSymbols(false);
+                setPendingBoardTile(null);
+                setPendingTileDeck(null);
+                setPendingTokenSupply(null);
+                setPendingSymbolId(null);
+                setPendingDeckSpot(null);
+                void beginTokenSupplyPlacement('single');
+              }}>
+                <Text>Place Token</Text>
+              </Pressable>
+
+              <Pressable style={styles.menuOption} onPress={() => {
+                setCreateMenuOpen(false);
+                setPendingBoardDie(null);
+                setPendingBoardTile(null);
+                setPendingTileDeck(null);
+                setPendingTokenSupply(null);
+                setPendingBoardToken(null);
+                void beginDiePlacement();
+              }}>
+                <Text>Place Die</Text>
+              </Pressable>
+
+              <Pressable
+                style={styles.menuOption}
+                onPress={() => {
+                  setCreateMenuOpen(false);
+                  setIsPlacingTileSnapPoint(false);
+                  setIsPlacingSymbol(false);
+                  setPendingSymbolId(null);
+                  setPendingDeckSpot(null);
+                  setPendingBoardTile(null);
+                  setPendingTileDeck(null);
+                  setPendingTokenSupply(null);
                   setScreen('home');
                 }}
               >
@@ -450,11 +1949,90 @@ function AppContent() {
                 style={styles.menuOption}
                 onPress={() => {
                   setCreateMenuOpen(false);
+                  setIsPlacingTileSnapPoint(false);
+                  setIsPlacingSymbol(false);
+                  setIsEditingSymbols(false);
+                  setPendingSymbolId(null);
+                  setPendingBoardTile(null);
+                  setPendingTileDeck(null);
+                  setPendingTokenSupply(null);
+                  beginDeckSpotPlacement();
+                }}
+              >
+                <Text>Place Deck / Discard Spot</Text>
+              </Pressable>
+
+              <Pressable
+                style={styles.menuOption}
+                onPress={() => {
+                  setCreateMenuOpen(false);
+                  setIsPlacingTileSnapPoint(false);
+                  setIsPlacingSymbol(false);
+                  setIsEditingSymbols(false);
+                  setPendingSymbolId(null);
+                  setPendingDeckSpot(null);
+                  setPendingBoardTile(null);
+                  setPendingTileDeck(null);
+                  setPendingTokenSupply(null);
                   setScreen('symbolLibrary');
                 }}
               >
                 <Text>Open Symbol Editor</Text>
               </Pressable>
+
+              <Pressable
+                style={styles.menuOption}
+                onPress={() => {
+                  setCreateMenuOpen(false);
+                  setIsPlacingTileSnapPoint(false);
+                  setIsPlacingSymbol(true);
+                  setIsEditingSymbols(false);
+                  setPendingSymbolId(null);
+                  setPendingDeckSpot(null);
+                  setPendingBoardTile(null);
+                  setPendingTileDeck(null);
+                  setPendingTokenSupply(null);
+                  setScreen('symbolLibrary');
+                }}
+              >
+                <Text>Place Symbol</Text>
+              </Pressable>
+
+              <Pressable
+                style={styles.menuOption}
+                onPress={() => {
+                  setCreateMenuOpen(false);
+                  setIsPlacingTileSnapPoint(false);
+                  setIsPlacingSymbol(false);
+                  setPendingSymbolId(null);
+                  setPendingDeckSpot(null);
+                  setPendingBoardTile(null);
+                  setPendingTileDeck(null);
+                  setPendingTokenSupply(null);
+                  setIsEditingSymbols((editing) => !editing);
+                }}
+              >
+                <Text>{isEditingSymbols ? 'Done Moving' : 'Move Mode'}</Text>
+              </Pressable>
+
+              <Pressable
+                style={styles.menuOption}
+                onPress={() => {
+                  setCreateMenuOpen(false);
+                  setIsPlacingTileSnapPoint(false);
+                  setIsPlacingSymbol(false);
+                  setIsEditingSymbols(false);
+                  setPendingSymbolId(null);
+                  setPendingDeckSpot(null);
+                  setPendingBoardTile(null);
+                  setPendingTileDeck(null);
+                  setPendingTokenSupply(null);
+                  setScreen('cardEditor');
+                }}
+              >
+                <Text>Card Editor</Text>
+              </Pressable>
+              </ScrollView>
             </View>
           ) : (
             // Hamburger button opens the in-game menu panel.
@@ -491,26 +2069,38 @@ function AppContent() {
                       - click an existing symbol to edit it
                       - delete a symbol from the list */}
                   <View style={styles.libraryHeader}>
-                    <Text style={styles.createTitle}>Custom Symbols</Text>
+                    <Text style={styles.createTitle}>
+                      {isPlacingSymbol ? 'Choose a Symbol' : 'Custom Symbols'}
+                    </Text>
 
                     <View style={styles.libraryHeaderActions}>
                       <Pressable
                         accessibilityRole="button"
                         accessibilityLabel="Create new symbol"
                         style={styles.libraryIconButton}
-                        onPress={() => {
-                          // Create a brand-new symbol with a unique ID based on the
-                          // current timestamp. This keeps each symbol unique while the
-                          // app is still in memory.
+                        onPress={async () => {
                           const id = Date.now();
-                          const newSymbol = {
-                            id,
-                            name: `Symbol ${symbols.length + 1}`,
-                          };
+                          const now = Date.now();
+                          const name = `Symbol ${symbols.length + 1}`;
 
-                          setSymbols((current) => [...current, newSymbol]);
-                          setActiveSymbolId(id);
-                          setScreen('symbolEditor');
+                          try {
+                            // Create the symbol row first so its strokes can reference it.
+                            await db.runAsync(
+                              `INSERT INTO symbols (id, name, created_at, updated_at)
+                              VALUES (?, ?, ?, ?)`,
+                              id,
+                              name,
+                              now,
+                              now
+                            );
+
+                            setSymbols((current) => [...current, { id, name }]);
+                            setActiveSymbolId(id);
+                            setScreen('symbolEditor');
+                          } catch (error) {
+                            console.error('Could not create symbol:', error);
+                            Alert.alert('Could not create symbol', 'Please try again.');
+                          }
                         }}
                       >
                         <Text style={styles.libraryIconText}>+</Text>
@@ -520,7 +2110,12 @@ function AppContent() {
                         accessibilityRole="button"
                         accessibilityLabel="Close symbol library"
                         style={styles.libraryIconButton}
-                        onPress={() => setScreen('createGame')}
+                onPress={() => {
+                  setIsPlacingSymbol(false);
+                  setPendingSymbolId(null);
+                  setPendingDeckSpot(null);
+                  setScreen('createGame');
+                }}
                       >
                         <Text style={styles.libraryIconText}>×</Text>
                       </Pressable>
@@ -541,9 +2136,17 @@ function AppContent() {
                         <Pressable
                           style={styles.symbolNameButton}
                           onPress={() => {
-                            // Selecting a symbol tells the app which one should be opened for editing.
-                            setActiveSymbolId(symbol.id);
-                            setScreen('symbolEditor');
+                            if (isPlacingSymbol) {
+                              // Return to the map with this shared-library symbol armed
+                              // for placement at the next map tap.
+                              setPendingSymbolId(symbol.id);
+                              setIsPlacingSymbol(false);
+                              setScreen('createGame');
+                            } else {
+                              // In the normal library flow, selecting a symbol opens its editor.
+                              setActiveSymbolId(symbol.id);
+                              setScreen('symbolEditor');
+                            }
                           }}
                         >
                           <Text>{symbol.name}</Text>
@@ -576,16 +2179,7 @@ function AppContent() {
                                 {
                                   text: 'Delete',
                                   style: 'destructive',
-                                  onPress: () => {
-                                    // Remove the symbol from the list and clear the
-                                    // active selection if the deleted item was selected.
-                                    setSymbols((current) =>
-                                      current.filter((item) => item.id !== symbol.id)
-                                    );
-                                    setActiveSymbolId((currentId) =>
-                                      currentId === symbol.id ? null : currentId
-                                    );
-                                  },
+                          onPress: () => void deleteSymbol(symbol),
                                 },
                               ]
                             )
@@ -629,27 +2223,7 @@ function AppContent() {
 
                           <Pressable
                             style={styles.renameActionButton}
-                            onPress={() => {
-                              // Trim removes extra whitespace so the user cannot save a blank
-                              // name. If the result is empty, we do nothing.
-                              const newName = renameText.trim();
-
-                              if (newName.length === 0 || renameSymbolId === null) {
-                                return;
-                              }
-
-                              // Update only the matching symbol in the array.
-                              // The map function goes through each item and changes the one with the
-                              // same id. All other symbols stay untouched.
-                              setSymbols((current) =>
-                                current.map((item) =>
-                                  item.id === renameSymbolId
-                                    ? { ...item, name: newName }
-                                    : item
-                                )
-                              );
-                              setRenameSymbolId(null);
-                            }}
+                            onPress={() => void saveSymbolName()}
                           >
                             <Text>Save</Text>
                           </Pressable>
@@ -686,18 +2260,16 @@ function AppContent() {
                         },
                       ]}
                     >
-                      <DrawingCanvas bottomInset={0} transparentBackground />
-                  </View>
-                    {symbolCanvasSize > 0 && (
-                      <View
-                        style={[
-                          styles.symbolDrawingArea,
-                          { width: symbolCanvasSize, height: symbolCanvasSize },
-                        ]}
-                      >
-                        <DrawingCanvas bottomInset={0} transparentBackground />
-                      </View>
-                    )}
+                      {/* The symbol canvas is fixed at 300 points, so use a
+                          compact one-row toolbar to keep every button inside it. */}
+                      <DrawingCanvas
+                        key={activeSymbolId ?? 'no-symbol'}
+                        bottomInset={0}
+                        transparentBackground
+                        compactToolbar
+                        symbolId={activeSymbolId ?? undefined}
+                      />
+                    </View>
                   </View>
                 </View>
               )}
@@ -722,7 +2294,7 @@ function AppContent() {
             buttonLayout,
             pressed && styles.buttonPressed,
           ]}
-          onPress={() => setScreen('projectPicker')}
+          onPress={() => { setProjectPickerMode('create'); setScreen('projectPicker'); }}
         >
           <Text style={styles.buttonText}>Create Game</Text>
         </Pressable>
@@ -733,7 +2305,7 @@ function AppContent() {
             buttonLayout,
             pressed && styles.buttonPressed,
           ]}
-          onPress={() => Alert.alert('Play Game', 'We’ll build this next.')}
+          onPress={() => { setProjectPickerMode('play'); setScreen('projectPicker'); }}
         >
           <Text style={styles.buttonText}>Play Game</Text>
         </Pressable>
@@ -752,1064 +2324,3 @@ function AppContent() {
     </View>
   );
 }
-
-// pointsToPath converts a list of points into a Skia Path object.
-// This is important because the drawing canvas does not draw freehand lines directly from
-// an array of coordinates. Instead, it turns the points into a path that the Canvas can
-// render as a smooth stroke.
-function pointsToPath(points: Point[]) {
-  const path = Skia.PathBuilder.Make();
-
-  if (points.length > 0) {
-    // Start the path at the first point, then connect every next point with a line.
-    path.moveTo(points[0].x, points[0].y);
-
-    for (const point of points.slice(1)) {
-      path.lineTo(point.x, point.y);
-    }
-  }
-
-  return path.build();
-}
-
-// DrawingCanvas is the main custom drawing area for the symbol editor.
-// It handles the user's touch input, draws each stroke onto a canvas, supports erasing,
-// allows changing the background color, and gives access to pen color and line width tools.
-function DrawingCanvas({
-    bottomInset,
-    transparentBackground = false,
-    surfaceId,
-  }: {
-    bottomInset: number;
-    transparentBackground?: boolean;
-    surfaceId?: string;
-  }) {
-
-  const db = useSQLiteContext();
-  // lineWidth controls stroke thickness for the pen tool.
-  const [lineWidth, setLineWidth] = useState(4);
-
-  // isErasing switches between pen mode and eraser mode.
-  const [isErasing, setIsErasing] = useState(false);
-
-  // strokes stores all completed lines that have been drawn and finalized.
-  const [strokes, setStrokes] = useState<Stroke[]>([]);
-
-  // draft is the stroke currently being drawn while the user is touching the screen.
-  // It is separate from strokes so we can show the live-in-progress path before it is saved.
-  const [draft, setDraft] = useState<Stroke | null>(null);
-
-  // draftRef keeps the current stroke in a ref so it can be updated quickly without forcing
-  // a re-render on every movement. This is important for smooth drawing behavior.
-  const draftRef = useRef<Stroke | null>(null);
-
-  // eraserPosition tracks the current touch point while erasing so we can show a small
-  // circular cursor on the canvas.
-  const [eraserPosition, setEraserPosition] = useState<Point | null>(null);
-
-  // backgroundColor is the color behind the drawing area.
-  const [backgroundColor, setBackgroundColor] = useState('#DDE8D2');
-
-  // penColor is the color used by the pen tool.
-  const [penColor, setPenColor] = useState('#111827');
-
-  // colorPickerTarget tells us whether the color picker is for the board background or pen color.
-  // When it is null, the modal is closed.
-  const [colorPickerTarget, setColorPickerTarget] =
-    useState<'background' | 'pen' | null>(null);
-
-  useEffect(() => {
-    if (!surfaceId) return;
-
-    let cancelled = false;
-
-    const loadBoard = async () => {
-      try {
-        const rows = await db.getAllAsync<SavedStrokeRow>(
-          `SELECT points_json, width, color, is_eraser
-          FROM strokes
-          WHERE surface_id = ?
-          ORDER BY order_index ASC`,
-          surfaceId
-        );
-
-        if (!cancelled) {
-          setStrokes(
-            rows.map((row) => ({
-              points: JSON.parse(row.points_json) as Point[],
-              width: row.width,
-              color: row.color,
-              eraser: row.is_eraser === 1,
-            }))
-          );
-        }
-      } catch (error) {
-        console.error('Could not load board strokes:', error);
-      }
-    };
-
-    void loadBoard();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [db, surfaceId]);
-
-  // finishStroke saves the current draft as a finalized stroke when the user lifts their finger.
-  // We only save it if it has more than one point, because a single tap would otherwise create
-  // a tiny meaningless mark.
-  const finishStroke = useCallback(() => {
-    const finished = draftRef.current;
-
-    if (finished && finished.points.length > 1) {
-      setStrokes((current) => [...current, finished]);
-
-      if (surfaceId) {
-        void db.runAsync(
-          `INSERT INTO strokes
-            (surface_id, points_json, width, color, is_eraser, order_index)
-          VALUES (
-            ?, ?, ?, ?, ?,
-            COALESCE(
-              (SELECT MAX(order_index) + 1 FROM strokes WHERE surface_id = ?),
-              0
-            )
-          )`,
-          surfaceId,
-          JSON.stringify(finished.points),
-          finished.width,
-          finished.color,
-          finished.eraser ? 1 : 0,
-          surfaceId
-        ).catch((error) => {
-          console.error('Could not save board stroke:', error);
-        });
-      }
-    }
-
-    draftRef.current = null;
-    setDraft(null);
-    setEraserPosition(null);
-  }, [db, surfaceId]);
-
-  const [boardOffset, setBoardOffset] = useState({ x: 0, y: 0 });
-  const boardOffsetRef = useRef({ x: 0, y: 0 });
-  const panStartRef = useRef({ x: 0, y: 0 });
-
-  const updateBoardOffset = useCallback((x: number, y: number) => {
-    const nextOffset = { x, y };
-    boardOffsetRef.current = nextOffset;
-    setBoardOffset(nextOffset);
-  }, []);
-
-  const [zoom, setZoom] = useState(1);
-  const zoomRef = useRef(1);
-  const pinchStartRef = useRef(1);
-
-  // PanResponder handles touch gestures for drawing.
-  // It listens for start, move, and release events so the app can collect points while the
-  // user drags across the canvas.
-  const drawGesture = usePanGesture({
-    minPointers: 1,
-    maxPointers: 1,
-    runOnJS: true,
-
-    onBegin: ({ x, y }) => {
-      const point = {
-        x: (x - boardOffsetRef.current.x) / zoomRef.current,
-        y: (y - boardOffsetRef.current.y) / zoomRef.current,
-      };
-
-      const newStroke: Stroke = {
-        points: [point],
-        width: lineWidth,
-        eraser: isErasing,
-        color: penColor,
-      };
-
-      draftRef.current = newStroke;
-      setDraft(newStroke);
-      setEraserPosition(isErasing ? point : null);
-    },
-
-    onUpdate: ({ x, y }) => {
-      const current = draftRef.current;
-      if (!current) return;
-
-      const point = {
-        x: (x - boardOffsetRef.current.x) / zoomRef.current,
-        y: (y - boardOffsetRef.current.y) / zoomRef.current,
-      };
-  
-      const lastPoint = current.points[current.points.length - 1];
-      const minDistance = 2 / zoomRef.current;
-
-      const dx = point.x - lastPoint.x;
-      const dy = point.y - lastPoint.y;
-
-      if (dx * dx + dy * dy < minDistance * minDistance) {
-        if (current.eraser) {
-          setEraserPosition(point);
-        }
-        return;
-      }
-
-      const updatedStroke = {
-        ...current,
-        points: [...current.points, point],
-      };
-
-      draftRef.current = updatedStroke;
-      setDraft(updatedStroke);
-
-      if (current.eraser) {
-        setEraserPosition(point);
-      }
-    },
-
-    onFinalize: finishStroke,
-  });
-
-  const boardPanGesture = usePanGesture({
-    minPointers: 2,
-    maxPointers: 2,
-    runOnJS: true,
-
-    onActivate: (event) => {
-      panStartRef.current = {
-        x: boardOffsetRef.current.x - event.translationX,
-        y: boardOffsetRef.current.y - event.translationY,
-      };
-    },
-
-    onUpdate: (event) => {
-      updateBoardOffset(
-        panStartRef.current.x + event.translationX,
-        panStartRef.current.y + event.translationY
-      );
-    },
-  });
-
-  const zoomGesture = usePinchGesture({
-    runOnJS: true,
-
-    onActivate: () => {
-      pinchStartRef.current = zoomRef.current;
-    },
-
-    onUpdate: (event) => {
-      const nextZoom = Math.max(
-        0.5,
-        Math.min(3, pinchStartRef.current * event.scale)
-      );
-
-      zoomRef.current = nextZoom;
-      setZoom(nextZoom);
-    },
-  });
-
-  const canvasGesture = useSimultaneousGestures(
-    drawGesture,
-    boardPanGesture,
-    zoomGesture
-  );
-
-  // renderStroke takes a stroke object and converts it into a visible Skia path.
-  // This keeps the render code repeatable for both saved strokes and the live draft.
-  const renderStroke = (
-    stroke: Stroke,
-    key: string,
-    path = pointsToPath(stroke.points)
-  ) => (
-    <Path
-      key={key}
-      path={path}
-      color={stroke.color}
-      style="stroke"
-      strokeWidth={stroke.width}
-      strokeCap="round"
-      strokeJoin="round"
-      blendMode={stroke.eraser ? 'clear' : 'srcOver'}
-    />
-  );
-  const completedStrokePaths = useMemo(
-    () => strokes.map((stroke) => pointsToPath(stroke.points)),
-    [strokes]
-  );
-
-  return (
-    <View
-      style={[
-        styles.matCanvas,
-        {
-          backgroundColor: transparentBackground
-            ? 'transparent'
-            : backgroundColor,
-        },
-      ]}
->
-      {/* This is the touchable drawing area. The PanResponder is attached to it so every
-          drag creates points that become part of a stroke. */}
-      <GestureDetector gesture={canvasGesture}>
-        <View style={styles.drawingTouchArea}>
-          <Canvas style={StyleSheet.absoluteFill}>
-            <Group
-              transform={[
-                { translateX: boardOffset.x },
-                { translateY: boardOffset.y },
-                { scale: zoom },
-              ]}
-            >
-              {strokes.map((stroke, index) =>
-                renderStroke(
-                  stroke,
-                  `stroke-${index}`,
-                  completedStrokePaths[index]
-                )
-              )}
-
-              {draft && renderStroke(draft, 'draft')}
-
-              {isErasing && eraserPosition && (
-                <Circle
-                  cx={eraserPosition.x}
-                  cy={eraserPosition.y}
-                  r={lineWidth / 2}
-                  color="#111827"
-                  style="stroke"
-                  strokeWidth={1.5}
-                />
-              )}
-            </Group>
-          </Canvas>
-        </View>
-      </GestureDetector>
-
-      {/* The drawing toolbar sits above the canvas and stays at the bottom of the screen.
-          It contains controls for board color, pen color, line width, and erasing. */}
-      <View
-        style={[
-          styles.toolbarPosition,
-          { bottom: bottomInset + 12 },
-        ]}
-      >
-        <View style={styles.toolbarPanel}>
-          {!transparentBackground && (
-            <View style={styles.colorControl}>
-              <Text style={styles.colorControlLabel}>Board</Text>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Choose board background color"
-                style={[
-                  styles.backgroundColorButton,
-                  { backgroundColor },
-                ]}
-                onPress={() => setColorPickerTarget('background')}
-              />
-            </View>
-          )}
-
-          <View style={styles.colorControl}>
-            <Text style={styles.colorControlLabel}>Pen</Text>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Choose pen color"
-              style={[styles.backgroundColorButton, { backgroundColor: penColor }]}
-              onPress={() => setColorPickerTarget('pen')}
-            />
-          </View>
-
-          <Slider
-            accessibilityLabel="Line width"
-            style={styles.lineWidthSlider}
-            minimumValue={1}
-            maximumValue={50}
-            step={1}
-            value={lineWidth}
-            onValueChange={setLineWidth}
-            minimumTrackTintColor="#315EFB"
-            maximumTrackTintColor="#9CA3AF"
-            thumbTintColor="#111827"
-          />
-
-          <View style={styles.previewSlot}>
-            <View
-              style={[
-                styles.brushPreview,
-                isErasing && styles.eraserPreview,
-                {
-                  width: lineWidth,
-                  height: lineWidth,
-                  borderRadius: lineWidth / 2,
-                  backgroundColor: isErasing ? 'transparent' : penColor,
-                },
-              ]}
-            />
-          </View>
-
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={isErasing ? 'Use pen' : 'Use eraser'}
-            style={[styles.eraserButton, isErasing && styles.selectedTool]}
-            onPress={() => setIsErasing((erasing) => !erasing)}
-          >
-             <Text>{isErasing ? 'Eraser ✓' : 'Eraser'}</Text>
-          </Pressable>
-        </View>
-      </View>
-
-      {/* The color picker is a modal popup that appears when the user taps a color swatch.
-          It lets them choose the board or pen color without leaving the drawing screen. */}
-      <Modal
-        visible={colorPickerTarget !== null}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setColorPickerTarget(null)}
-      >
-        <View style={styles.colorPickerBackdrop}>
-          <View style={styles.colorPickerDialog}>
-            <Text style={styles.menuTitle}>
-              {colorPickerTarget === 'pen' ? 'Pen color' : 'Board background'}
-            </Text>
-
-            <ColorPicker
-              value={colorPickerTarget === 'pen' ? penColor : backgroundColor}
-              onCompleteJS={({ hex }) => {
-                // When the user picks a color, update the correct setting.
-                if (colorPickerTarget === 'pen') {
-                  setPenColor(hex);
-                } else {
-                  setBackgroundColor(hex);
-                }
-              }}
-              style={styles.colorPicker}
-            >
-              <Preview style={styles.colorPickerPreview} />
-              <Panel3 style={styles.colorWheel} />
-              <BrightnessSlider style={styles.colorWheelSlider} />
-            </ColorPicker>
-
-            <Pressable
-              style={styles.colorPickerDone}
-              onPress={() => setColorPickerTarget(null)}
-            >
-              <Text style={styles.buttonText}>Done</Text>
-            </Pressable>
-          </View>
-        </View>
-      </Modal>
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  // STYLE SECTION
-  // This is where all of the visual design is stored.
-  // Each object below controls the look of a part of the app: the home screen,
-  // buttons, menu, mat, and symbol panels.
-  // If a section of the UI is not looking right, this is usually the place to fix it.
-
-  //Home Screen
-  screen: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 24,
-    backgroundColor: '#F3F4F6',
-  },
-  title: {
-    marginBottom: 32,
-    color: '#111827',
-    fontSize: 32,
-    fontWeight: '700',
-  },
-
-  //Menu Buttons
-  buttons: {
-    width: '100%',
-    maxWidth: 360,
-  },
-  buttonsLandscape: {
-    flexDirection: 'row',
-    maxWidth: 900,
-    gap: 12,
-  },
-  buttonPortrait: {
-    width: '100%',
-    marginBottom: 14,
-  },
-  buttonLandscape: {
-    flex: 1,
-  },
-  button: {
-    maxWidth: 360,
-    alignItems: 'center',
-    paddingVertical: 16,
-    borderRadius: 12,
-    backgroundColor: '#ffffff',
-    borderWidth: 2,
-    borderColor: '#000000'
-  },
-  buttonPressed: {
-    backgroundColor: '#00ff3c',
-    // opacity: 0.5,
-  },
-  buttonText: {
-    color: '#000000',
-    fontSize: 18,
-    fontWeight: '600',
-  },
-
-  //Create Game Screen
-  createScreen: {
-    flex: 1,
-    padding: 24,
-    backgroundColor: '#F3F4F6',
-  },
-  createHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  createTitle: {
-    color: '#111827',
-    fontSize: 28,
-    fontWeight: '700',
-  },
-
-  //Menu Dropdown
-  menuButton: {
-    position: 'absolute',
-    // top: 5,
-    // right: 5,
-    zIndex: 2,
-    elevation: 5,
-    padding: 12,
-    borderWidth: 1,
-    borderColor: '#9CA3AF',
-    borderRadius: 8,
-    backgroundColor: '#FFFFFF',
-    opacity: 0.75,
-  },
-  menuButtonText: {
-    color: '#000000',
-    fontSize: 16,
-  },
-  dropdown: {
-    position: 'absolute',
-    // top: 0,
-    // right: 0,
-    bottom: 0,
-    width: '20%',
-    maxWidth: 360,
-    zIndex: 3,
-    elevation: 8,
-    borderWidth: 1,
-    borderColor: '#9CA3AF',
-    // borderRadius: 10,
-    backgroundColor: '#FFFFFF',
-    overflow: 'hidden',
-    opacity: 0.75,
-  },
-  menuTitle: {
-    color: '#111827',
-    fontSize: 18,
-    fontWeight: '700',
-  },
-  menuOption: {
-    paddingHorizontal: 14,
-    paddingVertical: 14,
-    borderBottomWidth: 1,
-    borderBottomColor: '#E5E7EB',
-  },
-  menuHeader: {
-    minHeight: 50,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingLeft: 14,
-    paddingRight: 6,
-    borderBottomWidth: 1,
-    borderBottomColor: '#D1D5DB',
-  },
-  closeButton: {
-    width: 40,
-    height: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  closeText: {
-    color: '#111827',
-    fontSize: 28,
-  },
-
-  //Mat Placeholder
-  matPlaceholder: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
-
-  gameCanvas: {
-    flex: 1,
-    position: 'relative',
-    backgroundColor: '#F3F4F6',
-  },
-
-  //Filler so top doesn't look like weird cut off
-  topLine: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    backgroundColor: '#6d706d',
-    zIndex: 10,
-  },
-
-  //Symbols 
-  symbolsScreen: {
-    flex: 1,
-    padding: 24,
-    gap: 12,
-    backgroundColor: '#F3F4F6',
-  },
-
-  symbolRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingLeft: 16,
-    paddingRight: 8,
-    borderWidth: 1,
-    borderColor: '#9CA3AF',
-    borderRadius: 8,
-    backgroundColor: '#FFFFFF',
-  },
-
-  symbolOverlay: {
-    position: 'absolute',
-    top: 0,
-    right: 0,
-    bottom: 0,
-    left: 0,
-    alignItems: 'center',
-    justifyContent: 'center',
-    zIndex: 4,
-    elevation: 10,
-  },
-  symbolPanel: {
-    width: '88%',
-    height: '88%',
-    borderWidth: 1,
-    borderColor: '#9CA3AF',
-    borderRadius: 12,
-    backgroundColor: 'rgba(255, 255, 255, 1)',
-    overflow: 'hidden',
-  },
-  symbolPageContent: {
-    flex: 1,
-    padding: 20,
-    gap: 12,
-  },
-
-  libraryHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: 12,
-  },
-
-  libraryHeaderActions: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-
-  libraryIconButton: {
-    width: 42,
-    height: 42,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: '#9CA3AF',
-    borderRadius: 8,
-    backgroundColor: '#FFFFFF',
-  },
-
-  libraryIconText: {
-    color: '#111827',
-    fontSize: 26,
-  },
-
-  backArrowText: {
-    transform: [{ translateY: -4 }],
-  },
-
-  symbolNameButton: {
-    flex: 1,
-    paddingVertical: 16,
-  },
-
-  deleteButton: {
-    width: 40,
-    height: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  
-  deleteButtonText: {
-    color: '#B91C1C',
-    fontSize: 20,
-  },
-
-
-  renameButton: {
-    width: 40,
-    height: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  renameButtonText: {
-    color: '#111827',
-    fontSize: 22,
-  },
-  renameBackdrop: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 24,
-    backgroundColor: 'rgba(0, 0, 0, 0.35)',
-  },
-  renameDialog: {
-    width: '100%',
-    maxWidth: 360,
-    gap: 12,
-    padding: 20,
-    borderRadius: 12,
-    backgroundColor: '#FFFFFF',
-  },
-  renameInput: {
-    borderWidth: 1,
-    borderColor: '#9CA3AF',
-    borderRadius: 8,
-    padding: 12,
-    fontSize: 16,
-  },
-  renameActions: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    gap: 10,
-  },
-  renameActionButton: {
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 8,
-    backgroundColor: '#E5E7EB',
-  },
-
-  matCanvas: {
-    flex: 1,
-    position: 'relative',
-  },
-  drawingTouchArea: {
-    flex: 1,
-  },
-  toolbarPosition: {
-    position: 'absolute',
-    left: 12,
-    right: 12,
-    zIndex: 20,
-    elevation: 20,
-  },
-  toolbarScroll: {
-    maxHeight: 58,
-    borderWidth: 1,
-    borderColor: '#9CA3AF',
-    borderRadius: 12,
-    backgroundColor: 'rgba(255, 255, 255, 0.95)',
-  },
-  toolbar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-  },
-  toolbarLabel: {
-    fontSize: 13,
-    color: '#374151',
-  },
-  colorSwatch: {
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#6B7280',
-  },
-  selectedSwatch: {
-    borderWidth: 3,
-    borderColor: '#111827',
-  },
-  toolbarButton: {
-    width: 34,
-    height: 34,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: 8,
-    backgroundColor: '#E5E7EB',
-  },
-  sizeLabel: {
-    minWidth: 20,
-    textAlign: 'center',
-  },
-  eraserButton: {
-    width: 62,
-    height: 34,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: 8,
-    backgroundColor: '#E5E7EB',
-  },
-  selectedTool: {
-    backgroundColor: '#FDE68A',
-  },
-
-  lineWidthSlider: {
-    flex: 1,
-    minWidth: 60,
-    height: 36,
-  },
-  brushPreview: {
-    backgroundColor: '#111827',
-  },
-  toolbarPanel: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    padding: 6,
-    borderWidth: 1,
-    borderColor: '#9CA3AF',
-    borderRadius: 12,
-    backgroundColor: 'rgba(255, 255, 255, 0.95)',
-  },
-  toolbarRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 6,
-  },
-  lineWidthRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  previewSlot: {
-    width: 40,
-    height: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  eraserPreview: {
-    backgroundColor: 'transparent',
-    borderWidth: 2,
-    borderColor: '#111827',
-  },
-  backgroundPalette: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-  },
-  backgroundColorButton: {
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#374151',
-  },
-  colorPickerBackdrop: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 24,
-    backgroundColor: 'rgba(0, 0, 0, 0.4)',
-  },
-  colorPickerDialog: {
-    width: '100%',
-    maxWidth: 360,
-    gap: 14,
-    padding: 20,
-    borderRadius: 16,
-    backgroundColor: '#FFFFFF',
-  },
-  colorPicker: {
-    width: '100%',
-    gap: 12,
-  },
-  colorPickerPreview: {
-    height: 36,
-    borderRadius: 8,
-  },
-  colorWheel: {
-    width: '100%',
-    aspectRatio: 1,
-  },
-  colorWheelSlider: {
-    height: 30,
-  },
-  colorPickerDone: {
-    alignSelf: 'flex-end',
-    paddingHorizontal: 18,
-    paddingVertical: 10,
-    borderRadius: 8,
-    backgroundColor: '#315EFB',
-  },
-  colorControl: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-  },
-  colorControlLabel: {
-    fontSize: 12,
-    color: '#374151',
-  },
-
-  symbolDrawingAreaContainer: {
-    flex: 1,
-    width: '100%',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
-  symbolDrawingArea: {
-    overflow: 'hidden',
-    borderWidth: 1,
-    borderColor: '#9CA3AF',
-    borderRadius: 8,
-  },
-
-  projectPickerScreen: {
-    flex: 1,
-    padding: 24,
-    paddingBottom: 16,
-    backgroundColor: '#F3F4F6',
-  },
-
-  projectPickerButton: {
-    width: '100%',
-    maxWidth: 360,
-    alignItems: 'center',
-    paddingVertical: 14,
-    paddingHorizontal: 16,
-    borderRadius: 12,
-    backgroundColor: '#FFFFFF',
-    borderWidth: 2,
-    borderColor: '#000000',
-  },
-
-  projectPickerButtonPressed: {
-    backgroundColor: '#E5E7EB',
-  },
-
-  projectPickerButtonText: {
-    color: '#111827',
-    fontSize: 18,
-    fontWeight: '600',
-  },
-
-  projectScroll: {
-    flex: 1,
-    marginTop: 16,
-  },
-
-  projectGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    alignContent: 'flex-start',
-    justifyContent: 'flex-start',
-    gap: 12,
-  },
-
-  projectCard: {
-    width: 150,
-    height: 120,
-    padding: 10,
-    borderWidth: 1,
-    borderColor: '#9CA3AF',
-    borderRadius: 12,
-    backgroundColor: '#FFFFFF',
-  },
-
-  projectCardMain: {
-    maxWidth: 360,
-    flex: 1,
-    justifyContent: 'center',
-  },
-
-  projectName: {
-    color: '#111827',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-
-  projectDeleteButton: {
-    position: 'absolute',
-    top: 0,
-    bottom: 0,
-    right: 2,
-    width: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
-    zIndex: 1,
-  },
-
-  projectRenameButton: {
-    position: 'absolute',
-    top: 0,
-    bottom: 0,
-    right: 42,
-    width: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
-    zIndex: 1,
-  },
-
-  projectActions: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: 12,
-    paddingTop: 12,
-  },
-
-  projectActionButton: {
-    flex: 1,
-    maxWidth: 180,
-    alignItems: 'center',
-    paddingVertical: 14,
-    borderWidth: 2,
-    borderColor: '#000000',
-    borderRadius: 12,
-    backgroundColor: '#FFFFFF',
-  },
-
-  projectActionText: {
-    color: '#111827',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-
-  projectTile: {
-    width: '48%',
-    maxWidth: 240,
-    position: 'relative',
-  },
-
-  projectTileButton: {
-    width: '100%',
-    maxWidth: 260,
-    paddingHorizontal: 28,
-  },
-
-  projectTileText: {
-    textAlign: 'center',
-    paddingHorizontal: 4,
-  },
-});
