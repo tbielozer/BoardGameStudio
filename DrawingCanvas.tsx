@@ -1608,7 +1608,29 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           }));
           if (gameplayPileRefreshIds?.length) {
             const updatedById = new Map(updatedSpots.map((spot) => [spot.id, spot]));
-            setDeckSpots((current) => current.map((spot) => updatedById.get(spot.id) ?? spot));
+            setDeckSpots((current) => current.map((spot) => {
+              const updated = updatedById.get(spot.id);
+              if (!updated) return spot;
+              const sameTopCard = spot.topCard === updated.topCard || (
+                spot.topCard !== null && updated.topCard !== null
+                && spot.topCard.name === updated.topCard.name
+                && spot.topCard.frontSurfaceId === updated.topCard.frontSurfaceId
+                && spot.topCard.backSurfaceId === updated.topCard.backSurfaceId
+                && spot.topCard.widthInches === updated.topCard.widthInches
+                && spot.topCard.heightInches === updated.topCard.heightInches
+              );
+              if (spot.cardCount === updated.cardCount
+                && spot.faceUp === updated.faceUp
+                && sameTopCard) return spot;
+              // Keep position, orientation, and marker identity stable. Only
+              // the changed pile count and visible top face are replaced.
+              return {
+                ...spot,
+                cardCount: updated.cardCount,
+                faceUp: updated.faceUp,
+                topCard: updated.topCard,
+              };
+            }));
           } else {
             setDeckSpots(updatedSpots);
             setSelectedDeckSpotId(null);
@@ -2887,7 +2909,9 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     refreshGameplayPiles: (spotIds) => {
       setGameplayPileRefreshIds((current) => {
         if (!spotIds?.length) return null;
-        return [...new Set([...(current ?? []), ...spotIds])];
+        // Each completed card move names the exact piles it changed. Do not
+        // accumulate old pile IDs or a later draw will refresh unrelated faces.
+        return [...new Set(spotIds)];
       });
       setGameplayPileRevision((revision) => revision + 1);
     },
@@ -3188,6 +3212,11 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     () => tokenSupplyPlacements.map((item) => ({ ...item, tile: item.token })),
     [tokenSupplyPlacements]
   );
+  const clearGameplayDieSelection = () => {
+    // Returning the same empty array lets React skip a render when an item is
+    // picked up while no dice are selected.
+    setSelectedGameplayDieIds((current) => current.length === 0 ? current : []);
+  };
   // Mount artwork previews only after a drag actually starts. This avoids
   // loading or rasterizing a full card/tile face for a tap on a pile.
   const showGameplayDragPreview = () => {
@@ -3236,7 +3265,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         24 / (zoomRef.current * coordinateScale)
       );
       if (tokenHit) {
-        setSelectedGameplayDieIds([]);
+        clearGameplayDieSelection();
         setSelectedBoardTokenId(tokenHit.id);
         setActiveGameplayDragKey(`token-${tokenHit.id}`);
         setSelectedBoardTilePlacementId(null);
@@ -3267,7 +3296,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           Alert.alert('Token supply is empty', `There are no ${supplyHit.token.name} tokens left.`);
           return;
         }
-        setSelectedGameplayDieIds([]);
+        clearGameplayDieSelection();
         setSelectedBoardTokenId(null);
         setSelectedBoardTilePlacementId(null);
         gameplayTakeDragSessionRef.current = {
@@ -3294,7 +3323,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         // A tap is inert for every tile pile. Only a drag past the release
         // threshold takes a tile, and empty piles have nothing to drag.
         if (tileDeckHit.tileCount <= 0 || !tileDeckHit.tile) return;
-        setSelectedGameplayDieIds([]);
+        clearGameplayDieSelection();
         setSelectedBoardTokenId(null);
         setSelectedBoardTilePlacementId(null);
         gameplayTakeDragSessionRef.current = {
@@ -3326,7 +3355,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         10 / (zoomRef.current * coordinateScale)
       );
       if (tileHit) {
-        setSelectedGameplayDieIds([]);
+        clearGameplayDieSelection();
         setSelectedBoardTilePlacementId(tileHit.id);
         setActiveTileDragId(tileHit.id);
         gameplayTileDragActiveRef.current = gameplayMode;
@@ -3390,7 +3419,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       }
       const spot = findDeckSpotAtPoint(deckSpots, point, 14 / (zoomRef.current * coordinateScale));
       if (spot?.cardCount && spot.topCard) {
-        setSelectedGameplayDieIds([]);
+        clearGameplayDieSelection();
         // The card moves as a lightweight preview; the pile itself stays put
         // until a valid drop destination is found on release.
         deckCardDragSessionRef.current = {
@@ -4127,7 +4156,10 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     // per animation frame when the gesture reports updates faster than the display.
   };
 
-  const handleDrawFinalize = (finalTouch?: { x: number; y: number } | null) => {
+  const handleDrawFinalize = (
+    liveTilePosition?: { x: number; y: number; orientation: number } | null,
+    finalTouch?: { x: number; y: number } | null
+  ) => {
     // Gameplay drags no longer send every pointer event to JavaScript. Update
     // only the final board point here before committing the appropriate move.
     if (gameplayMode && finalTouch) {
@@ -4172,8 +4204,9 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         if (tileSession.changed) {
           tileSession.updatedPlacement = {
             ...tileSession.basePlacement,
-            x: finalPoint.x,
-            y: finalPoint.y,
+            x: liveTilePosition?.x ?? finalPoint.x,
+            y: liveTilePosition?.y ?? finalPoint.y,
+            orientation: liveTilePosition?.orientation ?? tileSession.basePlacement.orientation,
           };
         }
       }
@@ -4227,7 +4260,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         ? {
           x: tileSession.updatedPlacement.x,
           y: tileSession.updatedPlacement.y,
-          orientation: tileSession.basePlacement.orientation,
+          orientation: tileSession.updatedPlacement.orientation,
         }
         : null;
       finishBoardTileDrag(finalTilePosition);
@@ -4308,13 +4341,26 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     onFinalize: () => {
       'worklet';
       if (global._WORKLET) {
+        let liveTilePosition: { x: number; y: number; orientation: number } | null = null;
+        if (gameplayPieceDragKind.value === 1 && gameplayDragHasMoved.value) {
+          const scale = Math.max(0.001, gameplayPieceScale.value);
+          const transform = gameplayTileTransform.value;
+          // Save the exact position represented by the live animated tile.
+          // Its wrapper is laid out at the saved center, and this translation
+          // puts that center under the finger throughout the drag.
+          liveTilePosition = {
+            x: gameplayTileOriginalCenter.value.x + transform.x / scale,
+            y: gameplayTileOriginalCenter.value.y + transform.y / scale,
+            orientation: transform.rotation,
+          };
+        }
         const finalTouch = gameplayMode
           ? { x: gameplayLastTouchX.value, y: gameplayLastTouchY.value }
           : null;
         // The final point is captured above, so a following drag can safely
         // begin with an empty kind even if JavaScript is still saving this one.
         gameplayPieceDragKind.value = 0;
-        scheduleOnRN(handleDrawFinalize, finalTouch);
+        scheduleOnRN(handleDrawFinalize, liveTilePosition, finalTouch);
       } else {
         handleDrawFinalize();
       }

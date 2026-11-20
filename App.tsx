@@ -701,6 +701,74 @@ async function initializeDatabase(db: SQLiteDatabase) {
     FROM card_images
     JOIN cards ON cards.id = card_images.card_id;
   `);
+
+  // Gameplay repeatedly asks for a pile's top card, the next hand position,
+  // and each board surface's pieces. These indexes keep those reads bounded
+  // by one pile/surface instead of scanning every saved card or placement.
+  await db.execAsync(`
+    -- Board previews store one lossless flattened face image for fast rendering.
+    -- The original strokes and image layers stay editable; these rows are a cache.
+    CREATE TABLE IF NOT EXISTS surface_artwork_rasters (
+      surface_id TEXT NOT NULL,
+      variant TEXT NOT NULL,
+      png_data BLOB NOT NULL,
+      pixel_width INTEGER NOT NULL,
+      pixel_height INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (surface_id, variant),
+      FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE
+    );
+
+    CREATE TRIGGER IF NOT EXISTS invalidate_surface_raster_after_stroke_insert
+    AFTER INSERT ON strokes BEGIN
+      DELETE FROM surface_artwork_rasters WHERE surface_id = NEW.surface_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS invalidate_surface_raster_after_stroke_update
+    AFTER UPDATE ON strokes BEGIN
+      DELETE FROM surface_artwork_rasters WHERE surface_id IN (OLD.surface_id, NEW.surface_id);
+    END;
+    CREATE TRIGGER IF NOT EXISTS invalidate_surface_raster_after_stroke_delete
+    AFTER DELETE ON strokes BEGIN
+      DELETE FROM surface_artwork_rasters WHERE surface_id = OLD.surface_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS invalidate_surface_raster_after_image_insert
+    AFTER INSERT ON surface_images BEGIN
+      DELETE FROM surface_artwork_rasters WHERE surface_id = NEW.surface_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS invalidate_surface_raster_after_image_update
+    AFTER UPDATE ON surface_images BEGIN
+      DELETE FROM surface_artwork_rasters WHERE surface_id IN (OLD.surface_id, NEW.surface_id);
+    END;
+    CREATE TRIGGER IF NOT EXISTS invalidate_surface_raster_after_image_delete
+    AFTER DELETE ON surface_images BEGIN
+      DELETE FROM surface_artwork_rasters WHERE surface_id = OLD.surface_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS invalidate_surface_raster_after_background_update
+    AFTER UPDATE OF background_color, background_image_data, background_image_mime_type ON drawing_surfaces BEGIN
+      DELETE FROM surface_artwork_rasters WHERE surface_id = NEW.id;
+    END;
+
+    CREATE INDEX IF NOT EXISTS idx_play_cards_project_pile_order
+      ON play_card_instances(project_id, deck_spot_id, player_id, pile_order, id);
+    CREATE INDEX IF NOT EXISTS idx_play_cards_spot_order
+      ON play_card_instances(deck_spot_id, player_id, pile_order, id);
+    CREATE INDEX IF NOT EXISTS idx_play_cards_hand_order
+      ON play_card_instances(project_id, player_id, hand_order, id);
+    CREATE INDEX IF NOT EXISTS idx_deck_spots_surface
+      ON deck_spots(surface_id, id);
+    CREATE INDEX IF NOT EXISTS idx_tile_board_surface
+      ON tile_board_placements(surface_id, id);
+    CREATE INDEX IF NOT EXISTS idx_token_board_surface
+      ON token_board_placements(surface_id, id);
+    CREATE INDEX IF NOT EXISTS idx_token_supply_surface
+      ON token_supply_placements(surface_id, id);
+    CREATE INDEX IF NOT EXISTS idx_die_board_surface
+      ON die_board_placements(surface_id, id);
+    CREATE INDEX IF NOT EXISTS idx_strokes_surface_order
+      ON strokes(surface_id, order_index);
+    CREATE INDEX IF NOT EXISTS idx_surface_images_surface_order
+      ON surface_images(surface_id, order_index);
+  `);
 }
 export default function App() {
   return (
@@ -750,8 +818,8 @@ function AppContent() {
   const gameplayRef = useRef<GameplayPanelHandle | null>(null);
   const handDropRequestCounterRef = useRef(0);
   const boardCanvasRef = useRef<DrawingCanvasHandle | null>(null);
-  const notifyGameplayPilesChanged = useCallback(() => {
-    boardCanvasRef.current?.refreshGameplayPiles();
+  const notifyGameplayPilesChanged = useCallback((spotIds?: number[]) => {
+    boardCanvasRef.current?.refreshGameplayPiles(spotIds);
   }, []);
   const notifyGameplayStateChanged = useCallback(() => {
     boardCanvasRef.current?.refreshGameplayState();
@@ -1282,6 +1350,22 @@ function AppContent() {
                     if (projectPickerMode === 'play') {
                       setCreateMenuOpen(false);
                       setIsEditingSymbols(false);
+                      // Placement pickers and hints belong to the editor. Do
+                      // not carry an unfinished placement popup into play.
+                      setIsPlacingSymbol(false);
+                      setPendingSymbolId(null);
+                      setPendingDeckSpot(null);
+                      setDeckSpotSetupStep(null);
+                      setIsPlacingTileSnapPoint(false);
+                      setTilePlacementMode(null);
+                      setPendingBoardTile(null);
+                      setPendingTileDeck(null);
+                      setReplacingBoardTileId(null);
+                      setDiePlacementPickerOpen(false);
+                      setPendingBoardDie(null);
+                      setTokenSupplySetupStep(null);
+                      setPendingTokenSupply(null);
+                      setPendingBoardToken(null);
                       setIsPlaying(true);
                     } else {
                       setIsPlaying(false);
@@ -1403,7 +1487,7 @@ function AppContent() {
     return (
       <View style={styles.gameCanvas}>
         <Modal
-          visible={deckSpotSetupStep !== null}
+          visible={!isPlaying && deckSpotSetupStep !== null}
           transparent
           animationType="fade"
           onRequestClose={() => setDeckSpotSetupStep(null)}
@@ -1501,7 +1585,7 @@ function AppContent() {
           </View>
         </Modal>
         <Modal
-          visible={tilePlacementMode !== null}
+          visible={!isPlaying && tilePlacementMode !== null}
           transparent
           animationType="fade"
           onRequestClose={() => setTilePlacementMode(null)}
@@ -1534,7 +1618,7 @@ function AppContent() {
           </View>
         </Modal>
         <Modal
-          visible={tokenSupplySetupStep !== null}
+          visible={!isPlaying && tokenSupplySetupStep !== null}
           transparent
           animationType="fade"
           onRequestClose={() => setTokenSupplySetupStep(null)}
@@ -1600,7 +1684,7 @@ function AppContent() {
           </View>
         </Modal>
         <Modal
-          visible={diePlacementPickerOpen}
+          visible={!isPlaying && diePlacementPickerOpen}
           transparent
           animationType="fade"
           onRequestClose={() => setDiePlacementPickerOpen(false)}
