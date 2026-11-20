@@ -1,10 +1,11 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useState } from 'react';
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { Alert, Modal, Pressable, ScrollView, Text, TextInput, View, useWindowDimensions } from 'react-native';
 import { GestureDetector, usePanGesture } from 'react-native-gesture-handler';
 import { useSQLiteContext } from 'expo-sqlite';
 import Animated, { useAnimatedStyle, useSharedValue, type SharedValue } from 'react-native-reanimated';
 import { scheduleOnRN } from 'react-native-worklets';
 import { BoardTileArtworkPreview, type BoardTileVisual } from './DrawingCanvas';
+import { withSafeWriteTransaction } from './databaseTransactions';
 import { gameplayStyles as styles } from './gameplayStyles';
 
 type Player = { id: number; name: string; order_index: number };
@@ -18,7 +19,6 @@ type HandCard = {
   height_inches: number;
   face_up: number;
 };
-type PileCard = { id: number; card_id: number; pile_order: number };
 type PlayCardSnapshot = {
   id: number;
   project_id: string;
@@ -82,7 +82,7 @@ type GameplayPanelProps = {
   topInset: number;
   bottomInset: number;
   onClose: () => void;
-  onBoardPilesChanged: () => void;
+  onBoardPilesChanged: (spotIds?: number[]) => void;
   onGameplayStateChanged: () => void;
   drawFaceUp: boolean;
   onDrawFaceUpChange: (faceUp: boolean) => void;
@@ -118,6 +118,8 @@ export const GameplayPanel = forwardRef<GameplayPanelHandle, GameplayPanelProps>
   const [saveName, setSaveName] = useState('');
   const [savedGames, setSavedGames] = useState<GameplaySave[]>([]);
   const [heldCard, setHeldCard] = useState<HandCard | null>(null);
+  // Repeated gestures should not start overlapping card-write transactions.
+  const cardDrawInFlightRef = useRef(false);
   // Shared values move the held card without re-rendering the board and every
   // card preview for each finger update.
   const heldX = useSharedValue(0);
@@ -145,7 +147,21 @@ export const GameplayPanel = forwardRef<GameplayPanelHandle, GameplayPanelProps>
       projectId,
       playerId
     );
-    setHand(rows);
+    // Keep unchanged card objects so memoized thumbnails for the rest of the
+    // hand do not redraw just because one card was added or removed.
+    setHand((current) => {
+      const previousById = new Map(current.map((card) => [card.id, card]));
+      return rows.map((row) => {
+        const previous = previousById.get(row.id);
+        return previous && previous.card_id === row.card_id
+          && previous.face_up === row.face_up
+          && previous.name === row.name
+          && previous.surface_id === row.surface_id
+          && previous.back_surface_id === row.back_surface_id
+          ? previous
+          : row;
+      });
+    });
   }, [activePlayerId, db, projectId]);
 
   // Each saved deck marker gets its own physical shuffled pile. Seeding happens
@@ -233,6 +249,7 @@ export const GameplayPanel = forwardRef<GameplayPanelHandle, GameplayPanelProps>
     absoluteY: number
   ) => {
     if (isPreparingGame) return;
+    if (cardDrawInFlightRef.current) return;
     const droppedOnHand = absoluteY >= windowHeight - 185 - bottomInset;
     if (!droppedOnHand && (targetSpotId === null || targetSpotId === sourceSpotId)) return;
     if (droppedOnHand && activePlayerId === null) {
@@ -240,68 +257,74 @@ export const GameplayPanel = forwardRef<GameplayPanelHandle, GameplayPanelProps>
       return;
     }
 
+    cardDrawInFlightRef.current = true;
     try {
-      await db.withTransactionAsync(async () => {
-        const card = await db.getFirstAsync<PileCard>(
-          `SELECT id, card_id, pile_order FROM play_card_instances
-           WHERE project_id = ? AND deck_spot_id = ? AND player_id IS NULL
-           ORDER BY pile_order, id LIMIT 1`,
-          projectId,
-          sourceSpotId
-        );
-        if (!card) return;
-
+      await withSafeWriteTransaction(db, async (txn) => {
         if (droppedOnHand) {
-          const nextHandOrder = await db.getFirstAsync<{ next_order: number }>(
-            `SELECT COALESCE(MAX(hand_order), -1) + 1 AS next_order
-             FROM play_card_instances WHERE project_id = ? AND player_id = ?`,
-            projectId,
-            activePlayerId
-          );
-          await db.runAsync(
+          // Move the current top card and calculate its hand position in one
+          // statement. This avoids a read round trip and keeps order correct if
+          // two gameplay surfaces ever issue writes at the same time.
+          const movedCard = await txn.getFirstAsync<{ id: number }>(
             `UPDATE play_card_instances
-             SET deck_spot_id = NULL, player_id = ?, face_up = ?, hand_order = ?
-             WHERE id = ? AND project_id = ?`,
+             SET deck_spot_id = NULL,
+               player_id = ?,
+               face_up = ?,
+               hand_order = COALESCE((
+                 SELECT MAX(hand_order) + 1 FROM play_card_instances
+                 WHERE project_id = ? AND player_id = ?
+               ), 0)
+             WHERE id = (
+               SELECT id FROM play_card_instances
+               WHERE project_id = ? AND deck_spot_id = ? AND player_id IS NULL
+               ORDER BY pile_order, id LIMIT 1
+             ) AND project_id = ?
+             RETURNING id`,
             activePlayerId,
             drawFaceUp ? 1 : 0,
-            nextHandOrder?.next_order ?? 0,
-            card.id,
-            projectId
-          );
-        } else {
-          // Pile indexes are plain integers (there is no uniqueness constraint),
-          // so shift the target in one SQL update instead of issuing one query
-          // per card. This keeps large decks quick to draw into.
-          await db.runAsync(
-            `UPDATE play_card_instances SET pile_order = pile_order + 1
-             WHERE project_id = ? AND deck_spot_id = ? AND player_id IS NULL`,
             projectId,
-            targetSpotId
-          );
-          await db.runAsync(
-            `UPDATE play_card_instances
-             SET deck_spot_id = ?, player_id = NULL, face_up = ?, pile_order = 0
-             WHERE id = ? AND project_id = ?`,
-            targetSpotId,
-            drawFaceUp ? 1 : 0,
-            card.id,
-            projectId
-          );
-          // Compact the source pile after taking its top card.
-          await db.runAsync(
-            `UPDATE play_card_instances SET pile_order = pile_order - 1
-             WHERE project_id = ? AND deck_spot_id = ? AND player_id IS NULL AND pile_order > ?`,
+            activePlayerId,
             projectId,
             sourceSpotId,
-            card.pile_order
+            projectId
           );
+          if (!movedCard) return;
+        } else {
+          // Pile order is only used for sorting, so gaps are safe. Put the
+          // moved card just ahead of the destination's current top instead of
+          // shifting every card in both piles on each draw.
+          const movedCard = await txn.getFirstAsync<{ id: number }>(
+            `UPDATE play_card_instances
+             SET deck_spot_id = ?,
+               player_id = NULL,
+               face_up = ?,
+               pile_order = COALESCE((
+                 SELECT MIN(pile_order) FROM play_card_instances
+                 WHERE project_id = ? AND deck_spot_id = ? AND player_id IS NULL
+               ), 0) - 1
+             WHERE id = (
+               SELECT id FROM play_card_instances
+               WHERE project_id = ? AND deck_spot_id = ? AND player_id IS NULL
+               ORDER BY pile_order, id LIMIT 1
+             ) AND project_id = ?
+             RETURNING id`,
+            targetSpotId,
+            drawFaceUp ? 1 : 0,
+            projectId,
+            targetSpotId,
+            projectId,
+            sourceSpotId,
+            projectId
+          );
+          if (!movedCard) return;
         }
       });
       if (droppedOnHand && activePlayerId !== null) await refreshHand(activePlayerId);
-      onBoardPilesChanged();
+      onBoardPilesChanged(droppedOnHand ? [sourceSpotId] : [sourceSpotId, targetSpotId!]);
     } catch (error) {
       console.error('Could not move card from deck:', error);
       Alert.alert('Could not move card', 'Please try again.');
+    } finally {
+      cardDrawInFlightRef.current = false;
     }
   }, [activePlayerId, bottomInset, db, drawFaceUp, isPreparingGame, onBoardPilesChanged, projectId, refreshHand, windowHeight]);
 
@@ -346,6 +369,12 @@ export const GameplayPanel = forwardRef<GameplayPanelHandle, GameplayPanelProps>
       Alert.alert('Could not flip card', 'Please try again.');
     }
   }, [activePlayerId, db, projectId, refreshHand]);
+
+  const releaseHandCard = useCallback((cardId: number, absoluteX: number, absoluteY: number) => {
+    setHeldCard(null);
+    onHandCardDropRequest(cardId, absoluteX, absoluteY);
+  }, [onHandCardDropRequest]);
+  const cancelHeldCard = useCallback(() => setHeldCard(null), []);
 
   const saveCurrentGameplay = useCallback(async () => {
     const name = saveName.trim() || `Save ${new Date().toLocaleString()}`;
@@ -661,8 +690,8 @@ export const GameplayPanel = forwardRef<GameplayPanelHandle, GameplayPanelProps>
     );
     if (!target) return;
     try {
-      await db.withTransactionAsync(async () => {
-        const pile = await db.getAllAsync<{ id: number }>(
+      await withSafeWriteTransaction(db, async (txn) => {
+        const pile = await txn.getAllAsync<{ id: number }>(
           `SELECT id FROM play_card_instances WHERE deck_spot_id = ? AND id != ?
           ORDER BY pile_order, id`,
           target.id,
@@ -673,21 +702,21 @@ export const GameplayPanel = forwardRef<GameplayPanelHandle, GameplayPanelProps>
         orderedIds.splice(insertAt, 0, dropCardId);
         for (let index = 0; index < orderedIds.length; index += 1) {
           if (orderedIds[index] === dropCardId) {
-            await db.runAsync(
+            await txn.runAsync(
               `UPDATE play_card_instances SET deck_spot_id = ?, player_id = NULL, pile_order = ? WHERE id = ?`,
               target.id,
               index,
               dropCardId
             );
           } else {
-            await db.runAsync('UPDATE play_card_instances SET pile_order = ? WHERE id = ?', index, orderedIds[index]);
+            await txn.runAsync('UPDATE play_card_instances SET pile_order = ? WHERE id = ?', index, orderedIds[index]);
           }
         }
       });
       setDropCardId(null);
       setPendingDropSpotId(null);
       await refreshHand();
-      onBoardPilesChanged();
+      onBoardPilesChanged([target.id]);
     } catch (error) {
       console.error('Could not discard card:', error);
       Alert.alert('Could not discard card', 'Please try again.');
@@ -775,10 +804,9 @@ export const GameplayPanel = forwardRef<GameplayPanelHandle, GameplayPanelProps>
           {hand.length === 0 ? (
             <Text style={styles.emptyHandText}>{activePlayer ? 'Hold a deck on the board to draw cards.' : 'Add a player to start.'}</Text>
           ) : hand.map((card) => (
-            <HandCardItem key={card.id} card={card} dragX={heldX} dragY={heldY} onFlip={() => void flipHandCard(card)} onHold={() => setHeldCard(card)} onRelease={(x, y) => {
-              setHeldCard(null);
-              onHandCardDropRequest(card.id, x, y);
-            }} onCancel={() => setHeldCard(null)} />
+            <HandCardItem key={card.id} card={card} dragX={heldX} dragY={heldY}
+              onFlipCard={flipHandCard} onHoldCard={setHeldCard}
+              onReleaseCard={releaseHandCard} onCancel={cancelHeldCard} />
           ))}
         </ScrollView>
       </View>
@@ -902,21 +930,21 @@ function asTile(card: HandCard): BoardTileVisual {
   };
 }
 
-function HandCardItem({
+const HandCardItem = memo(function HandCardItem({
   card,
   dragX,
   dragY,
-  onFlip,
-  onHold,
-  onRelease,
+  onFlipCard,
+  onHoldCard,
+  onReleaseCard,
   onCancel,
 }: {
   card: HandCard;
   dragX: SharedValue<number>;
   dragY: SharedValue<number>;
-  onFlip: () => void;
-  onHold: () => void;
-  onRelease: (x: number, y: number) => void;
+  onFlipCard: (card: HandCard) => void;
+  onHoldCard: (card: HandCard) => void;
+  onReleaseCard: (cardId: number, x: number, y: number) => void;
   onCancel: () => void;
 }) {
   const pan = usePanGesture({
@@ -926,7 +954,7 @@ function HandCardItem({
     onActivate: ({ absoluteX, absoluteY }) => {
       dragX.value = absoluteX;
       dragY.value = absoluteY;
-      scheduleOnRN(onHold);
+      scheduleOnRN(onHoldCard, card);
     },
     onUpdate: ({ absoluteX, absoluteY }) => {
       dragX.value = absoluteX;
@@ -934,7 +962,7 @@ function HandCardItem({
     },
     onDeactivate: ({ absoluteX, absoluteY, canceled }) => {
       if (canceled) scheduleOnRN(onCancel);
-      else scheduleOnRN(onRelease, absoluteX, absoluteY);
+      else scheduleOnRN(onReleaseCard, card.id, absoluteX, absoluteY);
     },
   });
 
@@ -944,18 +972,18 @@ function HandCardItem({
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={`Flip ${card.name}`}
-          onPress={onFlip}
+          onPress={() => onFlipCard(card)}
           style={[styles.cardMiniature, card.face_up === 0 && styles.faceDownMiniature]}
         >
           <CardFaceArtwork card={card} width={56} height={56 * card.height_inches / card.width_inches} />
         </Pressable>
-        <Pressable accessibilityRole="button" style={styles.flipButton} onPress={onFlip}>
+        <Pressable accessibilityRole="button" style={styles.flipButton} onPress={() => onFlipCard(card)}>
           <Text style={styles.flipButtonText}>Flip</Text>
         </Pressable>
       </View>
     </GestureDetector>
   );
-}
+});
 
 function CardFaceArtwork({ card, width, height }: { card: HandCard; width: number; height: number }) {
   if (card.face_up === 0 && !card.back_surface_id) {

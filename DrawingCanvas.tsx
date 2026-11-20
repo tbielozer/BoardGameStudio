@@ -1,16 +1,23 @@
-import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Image, Modal, Pressable, StyleSheet, Text, View } from 'react-native';
-import { Canvas, Path, Skia, Circle, Group, Image as SkiaImage, Mask, Rect, FillType } from '@shopify/react-native-skia';
+import { Canvas, Path, Skia, Circle, Group, Image as SkiaImage, Mask, Rect, FillType, ImageFormat, useCanvasRef } from '@shopify/react-native-skia';
+import type { SkImage } from '@shopify/react-native-skia';
 import Slider from '@react-native-community/slider';
 import { GestureDetector, usePanGesture, useSimultaneousGestures, usePinchGesture } from 'react-native-gesture-handler';
 import ColorPicker, { BrightnessSlider, Panel3, Preview } from 'reanimated-color-picker';
 import { useSQLiteContext, type SQLiteDatabase } from 'expo-sqlite';
 import * as ImagePicker from 'expo-image-picker';
 import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanimated';
+import { scheduleOnRN } from 'react-native-worklets';
 import type { HostInstance } from 'react-native';
 import type { Point, SavedStrokeRow, Stroke } from './types';
 import { styles } from './styles';
 import { drawingCanvasStyles } from './drawingCanvasStyles';
+import { withSafeWriteTransaction } from './databaseTransactions';
+
+// Reanimated exposes this flag inside worklets so callbacks can keep their
+// normal synchronous path on JavaScript and schedule only UI-thread calls.
+declare const global: typeof globalThis & { _WORKLET?: boolean };
 
 const SYMBOL_CANVAS_SIZE = 300;
 const DECK_SPOT_UNITS_PER_INCH = 24;
@@ -18,6 +25,7 @@ const DECK_SPOT_MAX_EDGE = 120;
 const EMPTY_DECK_SPOT_SIZE_INCHES = 2.5;
 const BOARD_TILE_UNITS_PER_INCH = 24;
 const BOARD_TILE_MAX_EDGE = 240;
+const GAMEPLAY_SNAP_GRID_CELL_SIZE = 64;
 // pointsToPath converts a list of points into a Skia Path object.
 // This is important because the drawing canvas does not draw freehand lines directly from
 // an array of coordinates. Instead, it turns the points into a path that the Canvas can
@@ -71,14 +79,137 @@ type LoadedSurfaceArtwork = {
   images: PlacedImage[];
 };
 
+type DecodedSkiaImage = NonNullable<ReturnType<typeof Skia.Image.MakeImageFromEncoded>>;
+type DecodedTileArtwork = {
+  backgroundImage: DecodedSkiaImage | null;
+  images: Array<PlacedImage & { decoded: DecodedSkiaImage | null }>;
+};
+
+// Copies of the same tile face share a single set of Skia paths and decoded
+// images. Weak keys let these assets be collected when their artwork unloads.
+const tileArtworkPathCache = new WeakMap<Stroke[], ReturnType<typeof pointsToPath>[]>();
+const tileArtworkImageCache = new WeakMap<PlacedImage[], DecodedTileArtwork>();
+
 // Several placed copies can use one saved token, tile, or card face. Share an
 // in-flight load so those previews do not all run the same three SQLite reads.
 const pendingSurfaceArtworkLoads = new Map<string, Promise<LoadedSurfaceArtwork>>();
+// Gameplay can show dozens of copies of one saved tile or card. Keep the
+// decoded database representation too, not only the in-flight promise, so each
+// newly placed copy does not repeat three SQLite reads and JSON parsing.
+const completedSurfaceArtworkLoads = new Map<string, { artwork: LoadedSurfaceArtwork; weight: number }>();
+// Flattened Skia snapshots turn a face's background, strokes, and images into
+// one reusable GPU image while keeping the editable source strokes in SQLite.
+const completedSurfaceRasters = new Map<string, { image: SkImage; weight: number }>();
+const pendingSurfaceRasterLoads = new Map<string, Promise<SkImage | null>>();
+const pendingSurfaceRasterCaptures = new Set<string>();
+const surfaceRasterListeners = new Map<string, Set<(image: SkImage) => void>>();
+const surfaceArtworkGenerations = new Map<string, number>();
+const MAX_CACHED_SURFACE_ARTWORK = 32;
+const MAX_CACHED_SURFACE_ARTWORK_CHARS = 12 * 1024 * 1024;
+const MAX_CACHED_SURFACE_RASTERS = 48;
+const MAX_CACHED_SURFACE_RASTER_BYTES = 24 * 1024 * 1024;
+let cachedSurfaceArtworkChars = 0;
+let cachedSurfaceRasterBytes = 0;
+
+function getCachedSurfaceRaster(key: string) {
+  const cached = completedSurfaceRasters.get(key);
+  if (!cached) return null;
+  completedSurfaceRasters.delete(key);
+  completedSurfaceRasters.set(key, cached);
+  return cached.image;
+}
+
+function subscribeToSurfaceRaster(key: string, listener: (image: SkImage) => void) {
+  const listeners = surfaceRasterListeners.get(key) ?? new Set<(image: SkImage) => void>();
+  listeners.add(listener);
+  surfaceRasterListeners.set(key, listeners);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) surfaceRasterListeners.delete(key);
+  };
+}
+
+function cacheSurfaceRaster(key: string, image: SkImage) {
+  const previous = completedSurfaceRasters.get(key);
+  if (previous) cachedSurfaceRasterBytes -= previous.weight;
+  const weight = image.width() * image.height() * 4;
+  completedSurfaceRasters.delete(key);
+  if (weight <= MAX_CACHED_SURFACE_RASTER_BYTES) {
+    completedSurfaceRasters.set(key, { image, weight });
+    cachedSurfaceRasterBytes += weight;
+  }
+  surfaceRasterListeners.get(key)?.forEach((listener) => listener(image));
+  while (completedSurfaceRasters.size > MAX_CACHED_SURFACE_RASTERS
+    || cachedSurfaceRasterBytes > MAX_CACHED_SURFACE_RASTER_BYTES) {
+    const oldestKey = completedSurfaceRasters.keys().next().value;
+    if (oldestKey === undefined) break;
+    const oldest = completedSurfaceRasters.get(oldestKey);
+    if (oldest) cachedSurfaceRasterBytes -= oldest.weight;
+    completedSurfaceRasters.delete(oldestKey);
+  }
+}
+
+function loadCachedSurfaceRaster(
+  db: SQLiteDatabase,
+  key: string,
+  surfaceId: string,
+  variant: string
+): Promise<SkImage | null> {
+  const cached = getCachedSurfaceRaster(key);
+  if (cached) return Promise.resolve(cached);
+  const pending = pendingSurfaceRasterLoads.get(key);
+  if (pending) return pending;
+  const load = db.getFirstAsync<{ png_data: Uint8Array }>(
+    'SELECT png_data FROM surface_artwork_rasters WHERE surface_id = ? AND variant = ?',
+    surfaceId,
+    variant
+  ).then((row) => {
+    if (!row?.png_data) return null;
+    try {
+      const image = Skia.Image.MakeImageFromEncoded(Skia.Data.fromBytes(row.png_data));
+      if (image) cacheSurfaceRaster(key, image);
+      return image;
+    } catch (error) {
+      console.warn('Could not decode cached surface artwork:', surfaceId, error);
+      return null;
+    }
+  }).catch((error) => {
+    console.warn('Could not load cached surface artwork:', surfaceId, error);
+    return null;
+  });
+  pendingSurfaceRasterLoads.set(key, load);
+  void load.finally(() => {
+    if (pendingSurfaceRasterLoads.get(key) === load) pendingSurfaceRasterLoads.delete(key);
+  }).catch(() => {});
+  return load;
+}
+
+function invalidateSurfaceArtworkCache(surfaceId: string) {
+  surfaceArtworkGenerations.set(surfaceId, (surfaceArtworkGenerations.get(surfaceId) ?? 0) + 1);
+  const cached = completedSurfaceArtworkLoads.get(surfaceId);
+  if (cached) {
+    cachedSurfaceArtworkChars -= cached.weight;
+    completedSurfaceArtworkLoads.delete(surfaceId);
+  }
+  for (const [key, cachedRaster] of completedSurfaceRasters) {
+    if (!key.startsWith(`${surfaceId}|`)) continue;
+    cachedSurfaceRasterBytes -= cachedRaster.weight;
+    completedSurfaceRasters.delete(key);
+  }
+}
 
 function loadSurfaceArtwork(db: SQLiteDatabase, surfaceId: string): Promise<LoadedSurfaceArtwork> {
+  const cachedArtwork = completedSurfaceArtworkLoads.get(surfaceId);
+  if (cachedArtwork) {
+    // Refresh insertion order to implement a small least-recently-used cache.
+    completedSurfaceArtworkLoads.delete(surfaceId);
+    completedSurfaceArtworkLoads.set(surfaceId, cachedArtwork);
+    return Promise.resolve(cachedArtwork.artwork);
+  }
   const pendingLoad = pendingSurfaceArtworkLoads.get(surfaceId);
   if (pendingLoad) return pendingLoad;
 
+  const generationAtStart = surfaceArtworkGenerations.get(surfaceId) ?? 0;
   const load = Promise.all([
     db.getFirstAsync<{
       background_color: string | null;
@@ -137,7 +268,28 @@ function loadSurfaceArtwork(db: SQLiteDatabase, surfaceId: string): Promise<Load
       width: image.width,
       height: image.height,
     })),
-  }));
+  })).then((artwork) => {
+    // Do not put an old in-flight read back into the cache if an editor changed
+    // this surface while that read was pending.
+    if ((surfaceArtworkGenerations.get(surfaceId) ?? 0) === generationAtStart) {
+      const weight = (artwork.backgroundImage?.base64Data.length ?? 0)
+        + artwork.images.reduce((total, image) => total + image.base64Data.length, 0)
+        + artwork.strokes.reduce((total, stroke) => total + stroke.points.length * 32 + 96, 0);
+      if (weight <= MAX_CACHED_SURFACE_ARTWORK_CHARS) {
+        completedSurfaceArtworkLoads.set(surfaceId, { artwork, weight });
+        cachedSurfaceArtworkChars += weight;
+      }
+      while (completedSurfaceArtworkLoads.size > MAX_CACHED_SURFACE_ARTWORK
+        || cachedSurfaceArtworkChars > MAX_CACHED_SURFACE_ARTWORK_CHARS) {
+        const oldestSurfaceId = completedSurfaceArtworkLoads.keys().next().value;
+        if (oldestSurfaceId === undefined) break;
+        const oldest = completedSurfaceArtworkLoads.get(oldestSurfaceId);
+        if (oldest) cachedSurfaceArtworkChars -= oldest.weight;
+        completedSurfaceArtworkLoads.delete(oldestSurfaceId);
+      }
+    }
+    return artwork;
+  });
 
   pendingSurfaceArtworkLoads.set(surfaceId, load);
   void load.finally(() => {
@@ -180,6 +332,10 @@ type DeckSpotDragSession = {
 };
 
 type TileSnapPoint = { id: number; x: number; y: number; orientation: number };
+type TileSnapGrid = {
+  cellSize: number;
+  buckets: Record<string, TileSnapPoint[]>;
+};
 type TileSnapDragSession = {
   pointId: number;
   basePoint: TileSnapPoint;
@@ -486,12 +642,44 @@ function findNearestTileSnapPoint(
   threshold: number
 ) {
   let nearest: TileSnapPoint | null = null;
-  let nearestDistance = threshold;
+  // Comparing squared distances avoids a square root for every snap point on
+  // every drag update, which matters on boards with many snap points.
+  let nearestDistanceSquared = threshold * threshold;
   for (const snapPoint of snapPoints) {
-    const distance = Math.hypot(point.x - snapPoint.x, point.y - snapPoint.y);
-    if (distance <= nearestDistance) {
+    const deltaX = point.x - snapPoint.x;
+    const deltaY = point.y - snapPoint.y;
+    const distanceSquared = deltaX * deltaX + deltaY * deltaY;
+    if (distanceSquared <= nearestDistanceSquared) {
       nearest = snapPoint;
-      nearestDistance = distance;
+      nearestDistanceSquared = distanceSquared;
+    }
+  }
+  return nearest;
+}
+
+function findNearestTileSnapPointInGrid(
+  grid: TileSnapGrid,
+  point: Point,
+  threshold: number
+) {
+  let nearest: TileSnapPoint | null = null;
+  let nearestDistanceSquared = threshold * threshold;
+  const cellX = Math.floor(point.x / grid.cellSize);
+  const cellY = Math.floor(point.y / grid.cellSize);
+  const cellRadius = Math.ceil(threshold / grid.cellSize);
+  for (let offsetY = -cellRadius; offsetY <= cellRadius; offsetY += 1) {
+    for (let offsetX = -cellRadius; offsetX <= cellRadius; offsetX += 1) {
+      const points = grid.buckets[`${cellX + offsetX},${cellY + offsetY}`];
+      if (!points) continue;
+      for (const snapPoint of points) {
+        const deltaX = point.x - snapPoint.x;
+        const deltaY = point.y - snapPoint.y;
+        const distanceSquared = deltaX * deltaX + deltaY * deltaY;
+        if (distanceSquared <= nearestDistanceSquared) {
+          nearest = snapPoint;
+          nearestDistanceSquared = distanceSquared;
+        }
+      }
     }
   }
   return nearest;
@@ -556,7 +744,7 @@ export type DrawingCanvasHandle = {
   /** Open the image picker for this drawing surface. */
   importImage: () => void;
   /** Refresh only the card-pile preview after a card moves during gameplay. */
-  refreshGameplayPiles: () => void;
+  refreshGameplayPiles: (spotIds?: number[]) => void;
   /** Refresh board pieces after loading or resetting a saved game. */
   refreshGameplayState: () => void;
 };
@@ -681,24 +869,43 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   const [deckSpots, setDeckSpots] = useState<DeckSpot[]>([]);
   const [gameplayRefreshRevision, setGameplayRefreshRevision] = useState(0);
   const [gameplayPileRevision, setGameplayPileRevision] = useState(0);
+  // Card draws usually change only their source and destination piles. Keep a
+  // list so we can refresh those markers without reloading every board pile.
+  const [gameplayPileRefreshIds, setGameplayPileRefreshIds] = useState<number[] | null>(null);
   const [deckCardDragPreview, setDeckCardDragPreview] = useState<{ spot: DeckSpot; startPoint: Point } | null>(null);
+  const pendingDeckCardDragPreviewRef = useRef<{ spot: DeckSpot; startPoint: Point } | null>(null);
   const [selectedDeckSpotId, setSelectedDeckSpotId] = useState<number | null>(null);
   const [tileSnapPoints, setTileSnapPoints] = useState<TileSnapPoint[]>([]);
   const [selectedTileSnapPointId, setSelectedTileSnapPointId] = useState<number | null>(null);
+  const gameplaySnapGrid = useMemo<TileSnapGrid>(() => {
+    const buckets: Record<string, TileSnapPoint[]> = {};
+    for (const point of tileSnapPoints) {
+      const cellX = Math.floor(point.x / GAMEPLAY_SNAP_GRID_CELL_SIZE);
+      const cellY = Math.floor(point.y / GAMEPLAY_SNAP_GRID_CELL_SIZE);
+      const key = `${cellX},${cellY}`;
+      (buckets[key] ??= []).push(point);
+    }
+    return { cellSize: GAMEPLAY_SNAP_GRID_CELL_SIZE, buckets };
+  }, [tileSnapPoints]);
   const [boardTilePlacements, setBoardTilePlacements] = useState<BoardTilePlacement[]>([]);
   const [selectedBoardTilePlacementId, setSelectedBoardTilePlacementId] = useState<number | null>(null);
+  // Hides the saved tile while its single live preview follows the finger.
+  const [activeTileDragId, setActiveTileDragId] = useState<number | null>(null);
+  const gameplayTileDragActiveRef = useRef(false);
   const [tokenSupplyPlacements, setTokenSupplyPlacements] = useState<TokenSupplyPlacement[]>([]);
   const [boardTokenPlacements, setBoardTokenPlacements] = useState<BoardTokenPlacement[]>([]);
+  const pendingGameplayTokenTransformResetRef = useRef<{ id: number; x: number; y: number } | null>(null);
   const [selectedTokenSupplyId, setSelectedTokenSupplyId] = useState<number | null>(null);
   const [selectedBoardTokenId, setSelectedBoardTokenId] = useState<number | null>(null);
   const [activeGameplayDragKey, setActiveGameplayDragKey] = useState<string | null>(null);
-  const [gameplayTokenSupplyChoice, setGameplayTokenSupplyChoice] = useState<number | null>(null);
-  const [gameplayTileDeckChoice, setGameplayTileDeckChoice] = useState<number | null>(null);
+  const gameplayTileTakeInFlightRef = useRef(false);
   const [gameplayTakePreview, setGameplayTakePreview] = useState<GameplayTakePreview | null>(null);
+  const pendingGameplayTakePreviewRef = useRef<GameplayTakePreview | null>(null);
   const [boardDiePlacements, setBoardDiePlacements] = useState<BoardDiePlacement[]>([]);
   const [selectedBoardDieId, setSelectedBoardDieId] = useState<number | null>(null);
   const [selectedGameplayDieIds, setSelectedGameplayDieIds] = useState<number[]>([]);
   const [tilePlacementPreview, setTilePlacementPreview] = useState<TilePlacementPreview | null>(null);
+  const pendingGameplayTileTransformResetRef = useRef<BoardTilePlacement | null>(null);
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   const rootViewRef = useRef<HostInstance | null>(null);
   const canvasWindowOriginRef = useRef({ x: 0, y: 0 });
@@ -716,12 +923,30 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   const deckCardDragSessionRef = useRef<DeckCardDragSession | null>(null);
   const tokenMarkerRenderFrameRef = useRef<number | null>(null);
   const lastTokenMarkerRenderAtRef = useRef(0);
-  const lastTilePreviewRenderAtRef = useRef(0);
+  // A touch device may report more movement events per second than the screen
+  // can display. Keep only the latest preview and render it once per frame.
+  const tilePreviewRenderFrameRef = useRef<number | null>(null);
+  const pendingTilePreviewRef = useRef<TilePlacementPreview | null>(null);
+  const movePreviewRenderFrameRef = useRef<number | null>(null);
+  const pendingMovePreviewRef = useRef<(() => void) | null>(null);
   // These values move the active piece on the UI thread while play mode is
   // dragging. That avoids rebuilding every stroke and marker on every touch.
   const activePieceOffsetX = useSharedValue(0);
   const activePieceOffsetY = useSharedValue(0);
   const activePieceRotation = useSharedValue(0);
+  const drawGestureRunOnJS = useSharedValue(true);
+  // Gameplay drags use a UI-thread gesture for immediate visual tracking.
+  // The normal JS gesture still owns hit testing and the final database save.
+  const gameplayPieceDragKind = useSharedValue(0); // 1 = snapping tile, 2 = free-drag piece
+  const gameplayTileOriginalCenter = useSharedValue({ x: 0, y: 0 });
+  const gameplayDragHasMoved = useSharedValue(false);
+  const gameplayDragPreviewRequested = useSharedValue(false);
+  const gameplayDragStartLocal = useSharedValue({ x: 0, y: 0 });
+  const gameplayLastTouchX = useSharedValue(0);
+  const gameplayLastTouchY = useSharedValue(0);
+  const gameplayPieceBase = useSharedValue({ x: 0, y: 0, orientation: 0 });
+  const gameplayTileTransform = useSharedValue({ x: 0, y: 0, rotation: 0 });
+  const gameplayPieceScale = useSharedValue(1);
   const activePieceDragStyle = useAnimatedStyle(() => ({
     transform: [
       { translateX: activePieceOffsetX.value },
@@ -729,15 +954,65 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       { rotate: `${activePieceRotation.value}deg` },
     ],
   }));
+  // Keep tile movement in screen axes. Rotation belongs on the artwork inside
+  // the positioned wrapper, and one shared value updates both styles together.
+  const gameplayTilePositionStyle = useAnimatedStyle(() => ({
+    transform: [
+      { translateX: gameplayTileTransform.value.x },
+      { translateY: gameplayTileTransform.value.y },
+    ],
+  }));
+  const gameplayTileRotationStyle = useAnimatedStyle(() => ({
+    transform: [{ rotate: `${gameplayTileTransform.value.rotation}deg` }],
+  }));
+  const gameplayDragPreviewStyle = useAnimatedStyle(() => ({
+    opacity: gameplayDragHasMoved.value ? 0.92 : 0,
+  }));
+
+  // Coalesce move-mode state changes to at most one render per display frame.
+  // Some gestures (especially moving large symbol groups) otherwise transform
+  // and rebuild the artwork once for every raw touch event.
+  const scheduleMovePreview = useCallback((renderLatest: () => void) => {
+    pendingMovePreviewRef.current = renderLatest;
+    if (movePreviewRenderFrameRef.current !== null) return;
+    movePreviewRenderFrameRef.current = requestAnimationFrame(() => {
+      movePreviewRenderFrameRef.current = null;
+      const renderPending = pendingMovePreviewRef.current;
+      pendingMovePreviewRef.current = null;
+      renderPending?.();
+    });
+  }, []);
+
+  const flushMovePreview = useCallback(() => {
+    if (movePreviewRenderFrameRef.current !== null) {
+      cancelAnimationFrame(movePreviewRenderFrameRef.current);
+      movePreviewRenderFrameRef.current = null;
+    }
+    const renderPending = pendingMovePreviewRef.current;
+    pendingMovePreviewRef.current = null;
+    renderPending?.();
+  }, []);
 
   useEffect(() => {
     if (!gameplayMode) setSelectedGameplayDieIds([]);
-  }, [gameplayMode, surfaceId]);
+    // Gameplay hit-testing happens once on touch start. All subsequent touch
+    // samples stay on the UI runtime and only the final drop is sent to JS.
+    drawGestureRunOnJS.value = !gameplayMode;
+  }, [drawGestureRunOnJS, gameplayMode, surfaceId]);
 
+  // Copy the snap index only when the board's snap points change. Sending the
+  // whole grid to the UI runtime at every drag start scales poorly on large maps.
   useEffect(() => () => {
     if (tokenMarkerRenderFrameRef.current !== null) {
       cancelAnimationFrame(tokenMarkerRenderFrameRef.current);
     }
+    if (tilePreviewRenderFrameRef.current !== null) {
+      cancelAnimationFrame(tilePreviewRenderFrameRef.current);
+    }
+    if (movePreviewRenderFrameRef.current !== null) {
+      cancelAnimationFrame(movePreviewRenderFrameRef.current);
+    }
+    pendingMovePreviewRef.current = null;
   }, []);
 
   useEffect(() => {
@@ -1256,6 +1531,10 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     let cancelled = false;
     const loadDeckSpots = async () => {
       try {
+        const spotFilter = gameplayPileRefreshIds?.length
+          ? ` AND spot.id IN (${gameplayPileRefreshIds.map(() => '?').join(', ')})`
+          : '';
+        const spotQueryParameters = [surfaceId, ...(gameplayPileRefreshIds ?? [])];
         const rows = await db.getAllAsync<{
           id: number;
           x: number;
@@ -1289,7 +1568,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
                 ORDER BY instance.pile_order, instance.id LIMIT 1
               )
               LEFT JOIN cards AS card ON card.id = top_instance.card_id
-              WHERE spot.surface_id = ? ORDER BY spot.id ASC`
+              WHERE spot.surface_id = ?${spotFilter} ORDER BY spot.id ASC`
             : `SELECT spot.id, spot.x, spot.y, spot.orientation, spot.spot_type,
                 spot.deck_id, spot.face_up,
                 card.name AS top_card_name, card.surface_id AS front_surface_id,
@@ -1303,12 +1582,12 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
                 WHERE item.deck_id = spot.deck_id AND item.quantity > 0
                 ORDER BY item.card_id ASC LIMIT 1
               )
-              WHERE spot.surface_id = ? ORDER BY spot.id ASC`,
-          surfaceId
+              WHERE spot.surface_id = ?${spotFilter} ORDER BY spot.id ASC`,
+          ...spotQueryParameters
         );
 
         if (!cancelled) {
-          setDeckSpots(rows.map((row) => ({
+          const updatedSpots = rows.map((row) => ({
             id: row.id,
             x: row.x,
             y: row.y,
@@ -1326,8 +1605,14 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
                   heightInches: row.height_inches,
                 }
               : null,
-          })));
-          setSelectedDeckSpotId(null);
+          }));
+          if (gameplayPileRefreshIds?.length) {
+            const updatedById = new Map(updatedSpots.map((spot) => [spot.id, spot]));
+            setDeckSpots((current) => current.map((spot) => updatedById.get(spot.id) ?? spot));
+          } else {
+            setDeckSpots(updatedSpots);
+            setSelectedDeckSpotId(null);
+          }
         }
       } catch (error) {
         console.error('Could not load deck spots:', error);
@@ -1338,7 +1623,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     return () => {
       cancelled = true;
     };
-  }, [db, gameplayMode, gameplayPileRevision, surfaceId]);
+  }, [db, gameplayMode, gameplayPileRefreshIds, gameplayPileRevision, surfaceId]);
 
   // Snap anchors are saved in map drawing units so they stay lined up with all
   // other board content as the user pans or zooms the canvas.
@@ -1492,6 +1777,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           surfaceId,
           stroke.groupId ?? null
         );
+        invalidateSurfaceArtworkCache(surfaceId);
       }
     };
 
@@ -1537,6 +1823,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           );
         }
       });
+      invalidateSurfaceArtworkCache(surfaceId);
     }, 'Could not save symbol position or size:');
   }, [db, enqueueDatabaseAction, surfaceId]);
 
@@ -1555,6 +1842,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         image.id,
         surfaceId
       );
+      invalidateSurfaceArtworkCache(surfaceId);
     }, 'Could not save image position or size:');
   }, [db, enqueueDatabaseAction, surfaceId]);
 
@@ -1689,7 +1977,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   ) => {
     if (surfaceId === undefined || (!tile && !deck)) return;
     const snapThreshold = Math.max(24, Math.min(getBoardTileSize(tile).width, getBoardTileSize(tile).height) * 0.45);
-    const snapPoint = findNearestTileSnapPoint(tileSnapPoints, point, snapThreshold);
+    const snapPoint = findNearestTileSnapPointInGrid(gameplaySnapGrid, point, snapThreshold);
     const placementPoint = snapPoint ? { x: snapPoint.x, y: snapPoint.y } : point;
     const orientation = snapPoint?.orientation ?? 0;
     const tileId = deck ? null : tile?.id ?? null;
@@ -1718,7 +2006,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       console.error('Could not place tile on the board:', error);
       Alert.alert('Could not place tile', 'Please try again.');
     });
-  }, [db, onTileDeckPlaced, onTilePlaced, surfaceId, tileSnapPoints]);
+  }, [db, gameplaySnapGrid, onTileDeckPlaced, onTilePlaced, surfaceId, tileSnapPoints]);
 
   const placeTokenSupply = useCallback((point: Point, supply: BoardTokenSupply) => {
     if (surfaceId === undefined) return;
@@ -1820,7 +2108,6 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         }
         setSelectedBoardTokenId(addedToken.id);
         setSelectedBoardTilePlacementId(null);
-        setGameplayTokenSupplyChoice(null);
       }
     } catch (error) {
       console.error('Could not take token from supply:', error);
@@ -1832,32 +2119,42 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   // both the visible next tile and how many tiles remain.
   const takeGameplayTileFromDeck = useCallback(async (point: Point, deckId: number) => {
     if (surfaceId === undefined) return;
+    if (gameplayTileTakeInFlightRef.current) return;
+    gameplayTileTakeInFlightRef.current = true;
     const projectId = surfaceId.replace(/-board$/, '');
     const sourcePile = boardTilePlacements.find((item) => item.deckId === deckId);
     const sourceSize = getBoardTileSize(sourcePile?.tile ?? null);
     const snapThreshold = Math.max(24, Math.min(sourceSize.width, sourceSize.height) * 0.45);
-    const snapPoint = findNearestTileSnapPoint(tileSnapPoints, point, snapThreshold);
+    const snapPoint = findNearestTileSnapPointInGrid(gameplaySnapGrid, point, snapThreshold);
     const placeAt = snapPoint ? { x: snapPoint.x, y: snapPoint.y } : point;
     const orientation = snapPoint?.orientation ?? 0;
-    const tileQuery = `SELECT tile.id, tile.name, tile.shape, tile.width_inches, tile.height_inches,
-        tile.color, tile.surface_id AS front_surface_id, tile.back_surface_id
+    const availableTilesQuery = `SELECT tile.id, tile.name, tile.shape, tile.width_inches, tile.height_inches,
+        tile.color, tile.surface_id AS front_surface_id, tile.back_surface_id,
+        item.quantity +
+          COALESCE((SELECT SUM(returned.quantity) FROM gameplay_tile_deck_returns AS returned
+            WHERE returned.project_id = ? AND returned.deck_id = item.deck_id AND returned.tile_id = item.tile_id), 0) -
+          COALESCE((SELECT SUM(taken.quantity) FROM gameplay_tile_deck_takes AS taken
+            WHERE taken.project_id = ? AND taken.deck_id = item.deck_id AND taken.tile_id = item.tile_id), 0)
+          AS remaining_quantity
       FROM tile_deck_items AS item JOIN game_tiles AS tile ON tile.id = item.tile_id
-      WHERE item.deck_id = ? AND item.quantity +
-        COALESCE((SELECT SUM(returned.quantity) FROM gameplay_tile_deck_returns AS returned
-          WHERE returned.project_id = ? AND returned.deck_id = item.deck_id AND returned.tile_id = item.tile_id), 0) -
-        COALESCE((SELECT SUM(taken.quantity) FROM gameplay_tile_deck_takes AS taken
-          WHERE taken.project_id = ? AND taken.deck_id = item.deck_id AND taken.tile_id = item.tile_id), 0) > 0
-      ORDER BY item.tile_id LIMIT 1`;
+      WHERE item.deck_id = ?
+      ORDER BY item.tile_id`;
     try {
       const tileResult: { value: BoardTileVisual | null } = { value: null };
       const placementResult: { value: number | null } = { value: null };
       const remainingCountResult = { value: 0 };
       const nextTileResult: { value: BoardTileVisual | null } = { value: null };
-      await db.withTransactionAsync(async () => {
-        const tileRow = await db.getFirstAsync<{
+      await withSafeWriteTransaction(db, async (txn) => {
+        // One compact read gives us the next tile and count. Previously this
+        // same recipe was queried again after writing the draw, adding two
+        // database round trips to every tile placement.
+        const availableTiles = await txn.getAllAsync<{
           id: number; name: string; shape: BoardTileVisual['shape']; width_inches: number;
-          height_inches: number; color: string; front_surface_id: string; back_surface_id: string | null;
-        }>(tileQuery, deckId, projectId, projectId);
+          height_inches: number; color: string; front_surface_id: string;
+          back_surface_id: string | null; remaining_quantity: number;
+        }>(availableTilesQuery, projectId, projectId, deckId);
+        const availableTilesWithStock = availableTiles.filter((tile) => tile.remaining_quantity > 0);
+        const tileRow = availableTilesWithStock[0];
         if (!tileRow) throw new Error('This tile deck is empty.');
         tileResult.value = {
           id: tileRow.id, name: tileRow.name, shape: tileRow.shape,
@@ -1865,37 +2162,31 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           color: tileRow.color, frontSurfaceId: tileRow.front_surface_id,
           backSurfaceId: tileRow.back_surface_id,
         };
-        const result = await db.runAsync(
+        const result = await txn.runAsync(
           `INSERT INTO tile_board_placements (surface_id, tile_id, deck_id, x, y, orientation, face_up)
            VALUES (?, ?, NULL, ?, ?, ?, 1)`,
           surfaceId, tileRow.id, placeAt.x, placeAt.y, orientation
         );
         placementResult.value = result.lastInsertRowId;
-        await db.runAsync(
+        await txn.runAsync(
           `INSERT INTO gameplay_tile_placement_states
             (project_id, placement_id, x, y, orientation, face_up, is_added)
            VALUES (?, ?, ?, ?, ?, 1, 1)`,
           projectId, placementResult.value, placeAt.x, placeAt.y, orientation
         );
-        await db.runAsync(
+        await txn.runAsync(
           `INSERT INTO gameplay_tile_deck_takes (project_id, deck_id, tile_id, quantity, updated_at)
            VALUES (?, ?, ?, 1, ?) ON CONFLICT(project_id, deck_id, tile_id) DO UPDATE SET
            quantity = gameplay_tile_deck_takes.quantity + 1, updated_at = excluded.updated_at`,
           projectId, deckId, tileRow.id, Date.now()
         );
-        const countRow = await db.getFirstAsync<{ quantity: number }>(
-          `SELECT COALESCE((SELECT SUM(item.quantity) FROM tile_deck_items AS item WHERE item.deck_id = ?), 0) +
-            COALESCE((SELECT SUM(returned.quantity) FROM gameplay_tile_deck_returns AS returned
-              WHERE returned.project_id = ? AND returned.deck_id = ?), 0) -
-            COALESCE((SELECT SUM(taken.quantity) FROM gameplay_tile_deck_takes AS taken
-              WHERE taken.project_id = ? AND taken.deck_id = ?), 0) AS quantity`,
-          deckId, projectId, deckId, projectId, deckId
+        remainingCountResult.value = Math.max(
+          0,
+          availableTiles.reduce((count, tile) => count + tile.remaining_quantity, 0) - 1
         );
-        remainingCountResult.value = Math.max(0, countRow?.quantity ?? 0);
-        const nextRow = await db.getFirstAsync<{
-          id: number; name: string; shape: BoardTileVisual['shape']; width_inches: number;
-          height_inches: number; color: string; front_surface_id: string; back_surface_id: string | null;
-        }>(tileQuery, deckId, projectId, projectId);
+        const nextRow = tileRow.remaining_quantity > 1
+          ? tileRow
+          : availableTilesWithStock[1] ?? null;
         nextTileResult.value = nextRow ? {
           id: nextRow.id, name: nextRow.name, shape: nextRow.shape,
           widthInches: nextRow.width_inches, heightInches: nextRow.height_inches,
@@ -1918,13 +2209,14 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         ]);
         setSelectedBoardTilePlacementId(placementId);
         setSelectedBoardTokenId(null);
-        setGameplayTileDeckChoice(null);
       }
     } catch (error) {
       console.error('Could not take tile from deck:', error);
       Alert.alert('Could not take tile', error instanceof Error ? error.message : 'Please try again.');
+    } finally {
+      gameplayTileTakeInFlightRef.current = false;
     }
-  }, [boardTilePlacements, db, surfaceId, tileSnapPoints]);
+  }, [boardTilePlacements, db, gameplaySnapGrid, surfaceId, tileSnapPoints]);
 
   const placeBoardDie = useCallback((point: Point, die: BoardDieVisual) => {
     if (surfaceId === undefined) return;
@@ -2019,16 +2311,19 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       setBoardTokenPlacements((current) => current.map((item) => item.id === session.id
         ? { ...item, x: session.updatedX, y: session.updatedY } : item));
       if (gameplayMode) {
+        pendingGameplayTokenTransformResetRef.current = {
+          id: session.id,
+          x: session.updatedX,
+          y: session.updatedY,
+        };
         setActiveGameplayDragKey(null);
-        activePieceOffsetX.value = 0;
-        activePieceOffsetY.value = 0;
       }
     } else {
       setBoardDiePlacements((current) => current.map((item) => item.id === session.id
         ? { ...item, x: session.updatedX, y: session.updatedY } : item));
     }
     if (session.changed) queueTokenMarkerSave(session);
-  }, [activePieceOffsetX, activePieceOffsetY, gameplayMode, queueTokenMarkerSave]);
+  }, [gameplayMode, queueTokenMarkerSave]);
 
   const removeSelectedTokenMarker = useCallback(() => {
     const supplyId = selectedTokenSupplyId;
@@ -2213,23 +2508,67 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     }, 'Could not save tile position:');
   }, [db, enqueueDatabaseAction, gameplayMode, surfaceId]);
 
-  const finishBoardTileDrag = useCallback(() => {
+  const finishBoardTileDrag = useCallback((livePosition?: { x: number; y: number; orientation: number } | null) => {
     const session = tilePlacementDragSessionRef.current;
     tilePlacementDragSessionRef.current = null;
+    gameplayTileDragActiveRef.current = false;
+    if (tilePreviewRenderFrameRef.current !== null) {
+      cancelAnimationFrame(tilePreviewRenderFrameRef.current);
+      tilePreviewRenderFrameRef.current = null;
+    }
+    pendingTilePreviewRef.current = null;
+    setActiveTileDragId(null);
     setTilePlacementPreview(null);
-    if (session?.changed) {
-      setBoardTilePlacements((current) => current.map((item) =>
-        item.id === session.updatedPlacement.id ? session.updatedPlacement : item
-      ));
-      queueBoardTilePlacementSave(session.updatedPlacement);
+    if (session) {
+      let finalPlacement = session.updatedPlacement;
+
+      // During gameplay use the final finger point captured by the gesture,
+      // so the saved center matches the center shown beneath the finger.
+      if (gameplayMode && livePosition) {
+        finalPlacement = { ...session.basePlacement, ...livePosition };
+        session.changed = Math.hypot(
+          finalPlacement.x - session.basePlacement.x,
+          finalPlacement.y - session.basePlacement.y
+        ) > 0.5 || Math.abs(
+          finalPlacement.orientation - session.basePlacement.orientation
+        ) > 0.5;
+      }
+
+      if (session.changed) {
+        if (gameplayMode && finalPlacement.tile) {
+          const tileSize = getBoardTileSize(finalPlacement.tile);
+          const snapPoint = findNearestTileSnapPointInGrid(
+            gameplaySnapGrid,
+            { x: finalPlacement.x, y: finalPlacement.y },
+            Math.max(24, Math.min(tileSize.width, tileSize.height) * 0.45)
+          );
+          if (snapPoint) {
+            finalPlacement = {
+              ...finalPlacement,
+              x: snapPoint.x,
+              y: snapPoint.y,
+              orientation: snapPoint.orientation,
+            };
+          }
+        }
+        session.updatedPlacement = finalPlacement;
+        if (gameplayMode) pendingGameplayTileTransformResetRef.current = finalPlacement;
+        setBoardTilePlacements((current) => current.map((item) =>
+          item.id === finalPlacement.id ? finalPlacement : item
+        ));
+        queueBoardTilePlacementSave(finalPlacement);
+      }
     }
     if (gameplayMode) {
       setActiveGameplayDragKey(null);
-      activePieceOffsetX.value = 0;
-      activePieceOffsetY.value = 0;
-      activePieceRotation.value = 0;
+      if (!session?.changed) {
+        activePieceOffsetX.value = 0;
+        activePieceOffsetY.value = 0;
+        activePieceRotation.value = 0;
+        gameplayTileTransform.value = { x: 0, y: 0, rotation: 0 };
+      }
     }
-  }, [activePieceOffsetX, activePieceOffsetY, activePieceRotation, gameplayMode, queueBoardTilePlacementSave]);
+  }, [activePieceOffsetX, activePieceOffsetY, activePieceRotation, gameplayMode, gameplaySnapGrid, gameplayTileTransform, queueBoardTilePlacementSave]);
 
   const removeSelectedBoardTile = useCallback(() => {
     if (selectedBoardTilePlacementId === null) return;
@@ -2400,6 +2739,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           surfaceId,
           groupId
         );
+        invalidateSurfaceArtworkCache(surfaceId);
       }, 'Could not remove placed symbol:');
     }
   }, [db, enqueueDatabaseAction, selectedGroupId, surfaceId, symbolId]);
@@ -2416,6 +2756,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           imageId,
           surfaceId
         );
+        invalidateSurfaceArtworkCache(surfaceId);
       }, 'Could not remove image:');
     }
   }, [db, enqueueDatabaseAction, selectedImageId, surfaceId]);
@@ -2443,6 +2784,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           surfaceId
         );
       });
+      invalidateSurfaceArtworkCache(surfaceId);
       setSurfaceBackgroundImage({
         base64Data: selectedImage.base64Data,
         mimeType: selectedImage.mimeType,
@@ -2462,6 +2804,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         WHERE id = ?`,
         surfaceId
       );
+      invalidateSurfaceArtworkCache(surfaceId);
     }, 'Could not remove card background image:');
   }, [allowImageAsBackground, db, enqueueDatabaseAction, surfaceId]);
 
@@ -2516,6 +2859,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         imageHeight,
         surfaceId
       );
+      invalidateSurfaceArtworkCache(surfaceId);
 
       const newImage: PlacedImage = {
         id: insertResult.lastInsertRowId,
@@ -2540,11 +2884,16 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     importImage: () => {
       void importImage();
     },
-    refreshGameplayPiles: () => {
+    refreshGameplayPiles: (spotIds) => {
+      setGameplayPileRefreshIds((current) => {
+        if (!spotIds?.length) return null;
+        return [...new Set([...(current ?? []), ...spotIds])];
+      });
       setGameplayPileRevision((revision) => revision + 1);
     },
     refreshGameplayState: () => {
       setGameplayRefreshRevision((revision) => revision + 1);
+      setGameplayPileRefreshIds(null);
       setGameplayPileRevision((revision) => revision + 1);
     },
   }), [importImage]);
@@ -2609,6 +2958,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           surfaceId,
           groupId
         );
+        invalidateSurfaceArtworkCache(surfaceId);
       }, 'Could not undo symbol placement:');
     } else if (surfaceId) {
       enqueueDatabaseAction(async () => {
@@ -2622,6 +2972,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           )`,
           surfaceId
         );
+        invalidateSurfaceArtworkCache(surfaceId);
       }, 'Could not undo board stroke:');
     }
   }, [db, enqueueDatabaseAction, selectedGroupId, strokes, surfaceId, symbolId]);
@@ -2664,8 +3015,21 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   }, [queueStrokeSave]);
 
   const [boardOffset, setBoardOffset] = useState({ x: 0, y: 0 });
+  const [isCanvasTransforming, setIsCanvasTransforming] = useState(false);
   const boardOffsetRef = useRef({ x: 0, y: 0 });
-  const panStartRef = useRef({ x: 0, y: 0 });
+  const canvasPanOffsetX = useSharedValue(0);
+  const canvasPanOffsetY = useSharedValue(0);
+  const canvasPinchOffsetX = useSharedValue(0);
+  const canvasPinchOffsetY = useSharedValue(0);
+  const canvasGestureScale = useSharedValue(1);
+  const canvasTransformGestureCountRef = useRef(0);
+  const canvasTransformBaseRef = useRef({ offset: { x: 0, y: 0 }, zoom: 1 });
+  const canvasPanActiveOnUI = useSharedValue(false);
+  const canvasPinchActiveOnUI = useSharedValue(false);
+  const canvasPinchStartFocalX = useSharedValue(0);
+  const canvasPinchStartFocalY = useSharedValue(0);
+  const canvasBaseZoomOnUI = useSharedValue(1);
+  const pendingCanvasTransformResetRef = useRef<{ offset: Point; zoom: number } | null>(null);
 
   const updateBoardOffset = useCallback((x: number, y: number) => {
     const nextOffset = { x, y };
@@ -2675,7 +3039,97 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
 
   const [zoom, setZoom] = useState(1);
   const zoomRef = useRef(1);
-  const pinchStartRef = useRef(1);
+  useEffect(() => {
+    canvasBaseZoomOnUI.value = zoom;
+  }, [canvasBaseZoomOnUI, zoom]);
+  const canvasTransformStyle = useAnimatedStyle(() => {
+    const scale = canvasGestureScale.value;
+    return {
+      transform: [{
+        matrix: [
+          scale, 0, 0, 0,
+          0, scale, 0, 0,
+          0, 0, 1, 0,
+          canvasPanOffsetX.value + canvasPinchOffsetX.value,
+          canvasPanOffsetY.value + canvasPinchOffsetY.value,
+          0, 1,
+        ],
+      }],
+    };
+  });
+
+  const beginCanvasTransformGesture = useCallback(() => {
+    if (canvasTransformGestureCountRef.current === 0) {
+      pendingCanvasTransformResetRef.current = null;
+      setIsCanvasTransforming(true);
+      canvasTransformBaseRef.current = {
+        offset: boardOffsetRef.current,
+        zoom: zoomRef.current,
+      };
+      canvasBaseZoomOnUI.value = zoomRef.current;
+      canvasPanOffsetX.value = 0;
+      canvasPanOffsetY.value = 0;
+      canvasPinchOffsetX.value = 0;
+      canvasPinchOffsetY.value = 0;
+      canvasGestureScale.value = 1;
+    }
+    canvasTransformGestureCountRef.current += 1;
+  }, [canvasBaseZoomOnUI, canvasGestureScale, canvasPanOffsetX, canvasPanOffsetY, canvasPinchOffsetX, canvasPinchOffsetY]);
+
+  const finishCanvasTransformGesture = useCallback(() => {
+    if (canvasTransformGestureCountRef.current === 0) return;
+    canvasTransformGestureCountRef.current -= 1;
+    if (canvasTransformGestureCountRef.current > 0) return;
+
+    const base = canvasTransformBaseRef.current;
+    const scale = canvasGestureScale.value;
+    const nextZoom = base.zoom * scale;
+    const nextOffset = {
+      x: base.offset.x * scale + canvasPanOffsetX.value + canvasPinchOffsetX.value,
+      y: base.offset.y * scale + canvasPanOffsetY.value + canvasPinchOffsetY.value,
+    };
+    pendingCanvasTransformResetRef.current = { offset: nextOffset, zoom: nextZoom };
+    zoomRef.current = nextZoom;
+    setZoom(nextZoom);
+    updateBoardOffset(nextOffset.x, nextOffset.y);
+  }, [canvasGestureScale, canvasPanOffsetX, canvasPanOffsetY, canvasPinchOffsetX, canvasPinchOffsetY, updateBoardOffset]);
+
+  // Reset the temporary matrix in the commit that contains the final layout
+  // values, so the board never flashes back to its pre-gesture position.
+  useLayoutEffect(() => {
+    const pending = pendingCanvasTransformResetRef.current;
+    if (!pending || pending.zoom !== zoom
+      || pending.offset.x !== boardOffset.x || pending.offset.y !== boardOffset.y) return;
+    pendingCanvasTransformResetRef.current = null;
+    canvasPanOffsetX.value = 0;
+    canvasPanOffsetY.value = 0;
+    canvasPinchOffsetX.value = 0;
+    canvasPinchOffsetY.value = 0;
+    canvasGestureScale.value = 1;
+    setIsCanvasTransforming(false);
+  }, [boardOffset.x, boardOffset.y, canvasGestureScale, canvasPanOffsetX, canvasPanOffsetY, canvasPinchOffsetX, canvasPinchOffsetY, zoom]);
+
+  // A gameplay tile uses a shared-value transform while dragged. Clear that
+  // transform only after React has committed its new saved position.
+  useLayoutEffect(() => {
+    const pending = pendingGameplayTileTransformResetRef.current;
+    if (!pending || activeTileDragId !== null) return;
+    const committed = boardTilePlacements.find((item) => item.id === pending.id);
+    if (!committed || committed.x !== pending.x || committed.y !== pending.y) return;
+    pendingGameplayTileTransformResetRef.current = null;
+    gameplayTileTransform.value = { x: 0, y: 0, rotation: 0 };
+  }, [activeTileDragId, boardTilePlacements, gameplayTileTransform]);
+
+  useLayoutEffect(() => {
+    const pending = pendingGameplayTokenTransformResetRef.current;
+    if (!pending || activeGameplayDragKey !== null) return;
+    const committed = boardTokenPlacements.find((item) => item.id === pending.id);
+    if (!committed || committed.x !== pending.x || committed.y !== pending.y) return;
+    pendingGameplayTokenTransformResetRef.current = null;
+    activePieceOffsetX.value = 0;
+    activePieceOffsetY.value = 0;
+    activePieceRotation.value = 0;
+  }, [activeGameplayDragKey, activePieceOffsetX, activePieceOffsetY, activePieceRotation, boardTokenPlacements]);
 
   // Hand cards report screen coordinates when released. Convert that position
   // back into board coordinates so a card can be dropped on a deck marker.
@@ -2734,153 +3188,192 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     () => tokenSupplyPlacements.map((item) => ({ ...item, tile: item.token })),
     [tokenSupplyPlacements]
   );
-
-  // PanResponder handles touch gestures for drawing.
-  // It listens for start, move, and release events so the app can collect points while the
-  // user drags across the canvas.
-  const drawGesture = usePanGesture({
-    minPointers: 1,
-    maxPointers: 1,
-    runOnJS: true,
-    activateAfterLongPress: 0,
-
-    onBegin: ({ x, y }) => {
-      if (gameplayMode) {
-        if (!isInsideTileShape(x, y)) return;
-        const point = {
-          x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
-          y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
+  // Mount artwork previews only after a drag actually starts. This avoids
+  // loading or rasterizing a full card/tile face for a tap on a pile.
+  const showGameplayDragPreview = () => {
+    if (pendingDeckCardDragPreviewRef.current) {
+      setDeckCardDragPreview(pendingDeckCardDragPreviewRef.current);
+    }
+    if (pendingGameplayTakePreviewRef.current) {
+      setGameplayTakePreview(pendingGameplayTakePreviewRef.current);
+    }
+  };
+  // Keep gesture hit testing and state changes in these JS handlers. The pan
+  // callbacks schedule them only when that interaction needs JavaScript.
+  const handleDrawBegin = (x: number, y: number) => {
+    if (gameplayMode) {
+      drawGestureRunOnJS.value = false;
+      pendingDeckCardDragPreviewRef.current = null;
+      pendingGameplayTakePreviewRef.current = null;
+      if (!isInsideTileShape(x, y)) return;
+      const point = {
+        x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
+        y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
+      };
+      // Tapping dice adds or removes them from the current multi-die roll.
+      // Dice render above tokens, so check them first when markers overlap.
+      const gameplayDieHit = findBoardTileAtPoint(
+        boardDieHitTargets,
+        point,
+        10 / (zoomRef.current * coordinateScale)
+      );
+      if (gameplayDieHit) {
+        setSelectedGameplayDieIds((current) => current.includes(gameplayDieHit.id)
+          ? current.filter((id) => id !== gameplayDieHit.id)
+          : [...current, gameplayDieHit.id]);
+        setSelectedBoardDieId(null);
+        setSelectedBoardTokenId(null);
+        setSelectedBoardTilePlacementId(null);
+        setSelectedTokenSupplyId(null);
+        setActiveGameplayDragKey(null);
+        return;
+      }
+      // Placed tokens are drawn above supply markers, so they win hit tests
+      // whenever the two overlap on the map.
+      const tokenHit = findBoardTileAtPoint(
+        boardTokenHitTargets,
+        point,
+        24 / (zoomRef.current * coordinateScale)
+      );
+      if (tokenHit) {
+        setSelectedGameplayDieIds([]);
+        setSelectedBoardTokenId(tokenHit.id);
+        setActiveGameplayDragKey(`token-${tokenHit.id}`);
+        setSelectedBoardTilePlacementId(null);
+        setSelectedBoardDieId(null);
+        setSelectedTokenSupplyId(null);
+        tilePlacementDragSessionRef.current = null;
+        setTilePlacementPreview(null);
+        const token = boardTokenPlacements.find((item) => item.id === tokenHit.id)!;
+        activePieceOffsetX.value = 0;
+        activePieceOffsetY.value = 0;
+        activePieceRotation.value = token.orientation;
+        gameplayPieceDragKind.value = 2;
+        gameplayPieceBase.value = { x: token.x, y: token.y, orientation: token.orientation };
+        gameplayPieceScale.value = zoomRef.current * coordinateScale;
+        tokenMarkerDragSessionRef.current = {
+          kind: 'token', id: token.id, startPoint: point,
+          startX: token.x, startY: token.y, updatedX: token.x, updatedY: token.y, changed: false,
         };
-        if (gameplayTokenSupplyChoice !== null) {
-          void takeGameplayTokenFromSupply(point, gameplayTokenSupplyChoice);
+        return;
+      }
+      const supplyHit = findBoardTileAtPoint(
+        tokenSupplyHitTargets,
+        point,
+        24 / (zoomRef.current * coordinateScale)
+      );
+      if (supplyHit) {
+        if (supplyHit.quantity === 0) {
+          Alert.alert('Token supply is empty', `There are no ${supplyHit.token.name} tokens left.`);
           return;
         }
-        if (gameplayTileDeckChoice !== null) {
-          void takeGameplayTileFromDeck(point, gameplayTileDeckChoice);
-          return;
+        setSelectedGameplayDieIds([]);
+        setSelectedBoardTokenId(null);
+        setSelectedBoardTilePlacementId(null);
+        gameplayTakeDragSessionRef.current = {
+          kind: 'token', sourceId: supplyHit.id,
+          startPoint: point, updatedPoint: point, changed: false,
+        };
+        pendingGameplayTakePreviewRef.current = {
+          kind: 'token', sourceId: supplyHit.id, tile: supplyHit.token, startPoint: point,
+        };
+        activePieceOffsetX.value = 0;
+        activePieceOffsetY.value = 0;
+        activePieceRotation.value = supplyHit.orientation;
+        gameplayPieceDragKind.value = 2;
+        gameplayPieceBase.value = { x: point.x, y: point.y, orientation: supplyHit.orientation };
+        gameplayPieceScale.value = zoomRef.current * coordinateScale;
+        return;
+      }
+      const tileDeckHit = findBoardTileAtPoint(
+        boardTilePlacements.filter((item) => item.deckId !== null),
+        point,
+        14 / (zoomRef.current * coordinateScale)
+      );
+      if (tileDeckHit?.deckId !== null && tileDeckHit?.deckId !== undefined) {
+        // A tap is inert for every tile pile. Only a drag past the release
+        // threshold takes a tile, and empty piles have nothing to drag.
+        if (tileDeckHit.tileCount <= 0 || !tileDeckHit.tile) return;
+        setSelectedGameplayDieIds([]);
+        setSelectedBoardTokenId(null);
+        setSelectedBoardTilePlacementId(null);
+        gameplayTakeDragSessionRef.current = {
+          kind: 'tile', sourceId: tileDeckHit.deckId,
+          startPoint: point, updatedPoint: point, changed: false,
+        };
+        // Keep the tile artwork hidden until a real drag begins. This gives
+        // the player a centered preview to follow without creating a popup on
+        // a simple tap.
+        pendingGameplayTakePreviewRef.current = {
+          kind: 'tile', sourceId: tileDeckHit.deckId, tile: tileDeckHit.tile, startPoint: point,
+        };
+        activePieceOffsetX.value = 0;
+        activePieceOffsetY.value = 0;
+        activePieceRotation.value = tileDeckHit.orientation;
+        gameplayPieceDragKind.value = 2;
+        gameplayPieceBase.value = { x: point.x, y: point.y, orientation: tileDeckHit.orientation };
+        gameplayPieceScale.value = zoomRef.current * coordinateScale;
+        return;
+      }
+      // Play mode still supports direct manipulation of game pieces. Start
+      // these same lightweight drag sessions used by the editor so position
+      // updates are saved with the normal placement records.
+      const tileHit = findBoardTileAtPoint(
+        // A tile deck is a single pile marker, not a loose tile. Keep it
+        // anchored during play so touching it can't drag the whole stack.
+        boardTilePlacements.filter((item) => !gameplayMode || item.tileId !== null),
+        point,
+        10 / (zoomRef.current * coordinateScale)
+      );
+      if (tileHit) {
+        setSelectedGameplayDieIds([]);
+        setSelectedBoardTilePlacementId(tileHit.id);
+        setActiveTileDragId(tileHit.id);
+        gameplayTileDragActiveRef.current = gameplayMode;
+        if (gameplayMode) {
+          drawGestureRunOnJS.value = false;
         }
-        // Tapping dice adds or removes them from the current multi-die roll.
-        // Dice render above tokens, so check them first when markers overlap.
-        const gameplayDieHit = findBoardTileAtPoint(
-          boardDieHitTargets,
-          point,
-          10 / (zoomRef.current * coordinateScale)
-        );
-        if (gameplayDieHit) {
-          setSelectedGameplayDieIds((current) => current.includes(gameplayDieHit.id)
-            ? current.filter((id) => id !== gameplayDieHit.id)
-            : [...current, gameplayDieHit.id]);
-          setSelectedBoardDieId(null);
-          setSelectedBoardTokenId(null);
-          setSelectedBoardTilePlacementId(null);
-          setSelectedTokenSupplyId(null);
-          setActiveGameplayDragKey(null);
-          return;
-        }
-        // Placed tokens are drawn above supply markers, so they win hit tests
-        // whenever the two overlap on the map.
-        const tokenHit = findBoardTileAtPoint(
-          boardTokenHitTargets,
-          point,
-          24 / (zoomRef.current * coordinateScale)
-        );
-        if (tokenHit) {
-          setSelectedGameplayDieIds([]);
-          setSelectedBoardTokenId(tokenHit.id);
-          setActiveGameplayDragKey(`token-${tokenHit.id}`);
-          setSelectedBoardTilePlacementId(null);
-          setSelectedBoardDieId(null);
-          setSelectedTokenSupplyId(null);
-          tilePlacementDragSessionRef.current = null;
+        setSelectedBoardTokenId(null);
+        setSelectedBoardDieId(null);
+        setSelectedTokenSupplyId(null);
+        tokenMarkerDragSessionRef.current = null;
+        activePieceOffsetX.value = 0;
+        activePieceOffsetY.value = 0;
+        activePieceRotation.value = tileHit.orientation;
+        const tileScreenScale = zoomRef.current * coordinateScale;
+        gameplayTileOriginalCenter.value = { x: tileHit.x, y: tileHit.y };
+        // Some touch samples can arrive on the UI thread before JS finishes
+        // hit testing. Catch up to the latest sample now so the tile starts
+        // beneath the finger instead of appearing to lag behind it.
+        const startTouch = gameplayDragStartLocal.value;
+        const initialDelta = {
+          x: gameplayLastTouchX.value - startTouch.x,
+          y: gameplayLastTouchY.value - startTouch.y,
+        };
+        const touchMoved = Math.hypot(initialDelta.x, initialDelta.y) > 1;
+        gameplayDragHasMoved.value = touchMoved;
+        gameplayTileTransform.value = {
+          x: (point.x - tileHit.x) * tileScreenScale + initialDelta.x,
+          y: (point.y - tileHit.y) * tileScreenScale + initialDelta.y,
+          rotation: tileHit.orientation,
+        };
+        gameplayPieceDragKind.value = 1;
+        gameplayPieceBase.value = {
+          x: point.x,
+          y: point.y,
+          orientation: tileHit.orientation,
+        };
+        gameplayPieceScale.value = tileScreenScale;
+        tilePlacementDragSessionRef.current = {
+          placementId: tileHit.id,
+          basePlacement: tileHit,
+          updatedPlacement: tileHit,
+          startPoint: point,
+          changed: false,
+        };
+        if (gameplayMode) {
           setTilePlacementPreview(null);
-          const token = boardTokenPlacements.find((item) => item.id === tokenHit.id)!;
-          activePieceOffsetX.value = 0;
-          activePieceOffsetY.value = 0;
-          activePieceRotation.value = token.orientation;
-          tokenMarkerDragSessionRef.current = {
-            kind: 'token', id: token.id, startPoint: point,
-            startX: token.x, startY: token.y, updatedX: token.x, updatedY: token.y, changed: false,
-          };
-          return;
-        }
-        const supplyHit = findBoardTileAtPoint(
-          tokenSupplyHitTargets,
-          point,
-          24 / (zoomRef.current * coordinateScale)
-        );
-        if (supplyHit) {
-          if (supplyHit.quantity === 0) {
-            Alert.alert('Token supply is empty', `There are no ${supplyHit.token.name} tokens left.`);
-            return;
-          }
-          setGameplayTokenSupplyChoice(supplyHit.id);
-          setSelectedGameplayDieIds([]);
-          setGameplayTileDeckChoice(null);
-          setSelectedBoardTokenId(null);
-          setSelectedBoardTilePlacementId(null);
-          gameplayTakeDragSessionRef.current = {
-            kind: 'token', sourceId: supplyHit.id,
-            startPoint: point, updatedPoint: point, changed: false,
-          };
-          setGameplayTakePreview({ kind: 'token', sourceId: supplyHit.id, tile: supplyHit.token, startPoint: point });
-          activePieceOffsetX.value = 0;
-          activePieceOffsetY.value = 0;
-          activePieceRotation.value = supplyHit.orientation;
-          return;
-        }
-        const tileDeckHit = findBoardTileAtPoint(
-          boardTilePlacements.filter((item) => item.deckId !== null),
-          point,
-          14 / (zoomRef.current * coordinateScale)
-        );
-        if (tileDeckHit?.deckId !== null && tileDeckHit?.deckId !== undefined) {
-          if (tileDeckHit.tileCount <= 0 || !tileDeckHit.tile) {
-            Alert.alert('Tile deck is empty', `${tileDeckHit.deckName ?? 'This deck'} has no tiles left.`);
-            return;
-          }
-          setGameplayTileDeckChoice(tileDeckHit.deckId);
-          setSelectedGameplayDieIds([]);
-          setGameplayTokenSupplyChoice(null);
-          setSelectedBoardTokenId(null);
-          setSelectedBoardTilePlacementId(null);
-          gameplayTakeDragSessionRef.current = {
-            kind: 'tile', sourceId: tileDeckHit.deckId,
-            startPoint: point, updatedPoint: point, changed: false,
-          };
-          setGameplayTakePreview({ kind: 'tile', sourceId: tileDeckHit.deckId, tile: tileDeckHit.tile, startPoint: point });
-          activePieceOffsetX.value = 0;
-          activePieceOffsetY.value = 0;
-          activePieceRotation.value = tileDeckHit.orientation;
-          return;
-        }
-        // Play mode still supports direct manipulation of game pieces. Start
-        // these same lightweight drag sessions used by the editor so position
-        // updates are saved with the normal placement records.
-        const tileHit = findBoardTileAtPoint(
-          // A tile deck is a single pile marker, not a loose tile. Keep it
-          // anchored during play so touching it can't drag the whole stack.
-          boardTilePlacements.filter((item) => !gameplayMode || item.tileId !== null),
-          point,
-          10 / (zoomRef.current * coordinateScale)
-        );
-        if (tileHit) {
-          setSelectedGameplayDieIds([]);
-          setSelectedBoardTilePlacementId(tileHit.id);
-          setActiveGameplayDragKey(`tile-${tileHit.id}`);
-          setSelectedBoardTokenId(null);
-          setSelectedBoardDieId(null);
-          setSelectedTokenSupplyId(null);
-          tokenMarkerDragSessionRef.current = null;
-          activePieceOffsetX.value = 0;
-          activePieceOffsetY.value = 0;
-          activePieceRotation.value = tileHit.orientation;
-          tilePlacementDragSessionRef.current = {
-            placementId: tileHit.id,
-            basePlacement: tileHit,
-            updatedPlacement: tileHit,
-            startPoint: point,
-            changed: false,
-          };
+        } else {
           setTilePlacementPreview({
             tile: tileHit.tile,
             deckId: tileHit.deckId,
@@ -2892,639 +3385,667 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
             orientation: tileHit.orientation,
             snapped: false,
           });
-          return;
         }
-        const spot = findDeckSpotAtPoint(deckSpots, point, 14 / (zoomRef.current * coordinateScale));
-        if (spot?.cardCount && spot.topCard) {
-          setSelectedGameplayDieIds([]);
-          // The card moves as a lightweight preview; the pile itself stays put
-          // until a valid drop destination is found on release.
-          deckCardDragSessionRef.current = {
-            sourceSpotId: spot.id,
-            startPoint: point,
-            updatedPoint: point,
-            screenY: y,
-            changed: false,
-          };
-          setDeckCardDragPreview({ spot, startPoint: point });
-          activePieceOffsetX.value = 0;
-          activePieceOffsetY.value = 0;
-          activePieceRotation.value = spot.orientation;
-          return;
-        }
-        setSelectedBoardTokenId(null);
-        setSelectedBoardTilePlacementId(null);
+        return;
+      }
+      const spot = findDeckSpotAtPoint(deckSpots, point, 14 / (zoomRef.current * coordinateScale));
+      if (spot?.cardCount && spot.topCard) {
         setSelectedGameplayDieIds([]);
-        setActiveGameplayDragKey(null);
+        // The card moves as a lightweight preview; the pile itself stays put
+        // until a valid drop destination is found on release.
+        deckCardDragSessionRef.current = {
+          sourceSpotId: spot.id,
+          startPoint: point,
+          updatedPoint: point,
+          screenY: y,
+          changed: false,
+        };
+        pendingDeckCardDragPreviewRef.current = { spot, startPoint: point };
+        activePieceOffsetX.value = 0;
+        activePieceOffsetY.value = 0;
+        activePieceRotation.value = spot.orientation;
+        gameplayPieceDragKind.value = 2;
+        gameplayPieceBase.value = { x: point.x, y: point.y, orientation: spot.orientation };
+        gameplayPieceScale.value = zoomRef.current * coordinateScale;
         return;
       }
-      if (!isInsideTileShape(x, y)) return;
-      const point = {
-        x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
-        y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
+      setSelectedBoardTokenId(null);
+      setSelectedBoardTilePlacementId(null);
+      setSelectedGameplayDieIds([]);
+      setActiveGameplayDragKey(null);
+      return;
+    }
+    if (!isInsideTileShape(x, y)) return;
+    const point = {
+      x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
+      y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
+    };
+
+    if (placementTokenSupply) {
+      placeTokenSupply(point, placementTokenSupply);
+      return;
+    }
+
+    if (placementToken) {
+      placeBoardToken(point, placementToken);
+      return;
+    }
+
+    if (placementDie) {
+      placeBoardDie(point, placementDie);
+      return;
+    }
+
+    if (placementTile !== undefined || placementTileDeck !== undefined) {
+      const tile = placementTile ?? placementTileDeck?.topTile ?? null;
+      const snapThreshold = Math.max(24, Math.min(getBoardTileSize(tile).width, getBoardTileSize(tile).height) * 0.45);
+      const snapPoint = findNearestTileSnapPoint(tileSnapPoints, point, snapThreshold);
+      const preview: TilePlacementPreview = {
+        tile,
+        deckId: placementTileDeck?.id ?? null,
+        deckName: placementTileDeck?.name ?? null,
+        tileCount: placementTileDeck?.tileCount ?? 0,
+        faceUp: true,
+        x: snapPoint?.x ?? point.x,
+        y: snapPoint?.y ?? point.y,
+        orientation: snapPoint?.orientation ?? 0,
+        snapped: snapPoint !== null,
       };
+      tilePlacementSessionRef.current = preview;
+      setTilePlacementPreview(preview);
+      return;
+    }
 
-      if (placementTokenSupply) {
-        placeTokenSupply(point, placementTokenSupply);
+    if (placementTileSnapPoint) {
+      placeTileSnapPoint(point);
+      return;
+    }
+
+    if (placementDeckSpot !== undefined) {
+      placeDeckSpot(point, placementDeckSpot);
+      return;
+    }
+
+    if (placementSymbolId !== undefined) {
+      const selectedSymbol = placementSymbolData;
+      if (
+        selectedSymbol?.id !== placementSymbolId ||
+        selectedSymbol.strokes.length === 0
+      ) {
         return;
       }
 
-      if (placementToken) {
-        placeBoardToken(point, placementToken);
-        return;
-      }
+      // Symbols are drawn in a 300 x 300 editor. Scale them to about 105 x 105
+      // drawing units and center the saved artwork around the tap location.
+      const symbolScale = placementSymbolScale;
+      const groupId = `symbol-${Date.now()}-${placementGroupCounterRef.current++}`;
+      const placedStrokes = selectedSymbol.strokes.map((stroke) => ({
+        ...stroke,
+        points: stroke.points.map((symbolPoint) => ({
+          x: point.x + (symbolPoint.x - SYMBOL_CANVAS_SIZE / 2) * symbolScale,
+          y: point.y + (symbolPoint.y - SYMBOL_CANVAS_SIZE / 2) * symbolScale,
+        })),
+        width: Math.max(1 / coordinateScale, stroke.width * symbolScale),
+        groupId,
+      }));
 
-      if (placementDie) {
-        placeBoardDie(point, placementDie);
-        return;
-      }
+      setStrokes((current) => [...current, ...placedStrokes]);
+      setRedoStrokes([]);
+      placedStrokes.forEach(queueStrokeSave);
+      if (!repeatSymbolPlacement) onSymbolPlaced?.();
+      return;
+    }
 
-      if (placementTile !== undefined || placementTileDeck !== undefined) {
-        const tile = placementTile ?? placementTileDeck?.topTile ?? null;
-        const snapThreshold = Math.max(24, Math.min(getBoardTileSize(tile).width, getBoardTileSize(tile).height) * 0.45);
-        const snapPoint = findNearestTileSnapPoint(tileSnapPoints, point, snapThreshold);
-        const preview: TilePlacementPreview = {
-          tile,
-          deckId: placementTileDeck?.id ?? null,
-          deckName: placementTileDeck?.name ?? null,
-          tileCount: placementTileDeck?.tileCount ?? 0,
-          faceUp: true,
-          x: snapPoint?.x ?? point.x,
-          y: snapPoint?.y ?? point.y,
-          orientation: snapPoint?.orientation ?? 0,
-          snapped: snapPoint !== null,
-        };
-        tilePlacementSessionRef.current = preview;
-        setTilePlacementPreview(preview);
-        return;
-      }
-
-      if (placementTileSnapPoint) {
-        placeTileSnapPoint(point);
-        return;
-      }
-
-      if (placementDeckSpot !== undefined) {
-        placeDeckSpot(point, placementDeckSpot);
-        return;
-      }
-
-      if (placementSymbolId !== undefined) {
-        const selectedSymbol = placementSymbolData;
-        if (
-          selectedSymbol?.id !== placementSymbolId ||
-          selectedSymbol.strokes.length === 0
-        ) {
-          return;
-        }
-
-        // Symbols are drawn in a 300 x 300 editor. Scale them to about 105 x 105
-        // drawing units and center the saved artwork around the tap location.
-        const symbolScale = placementSymbolScale;
-        const groupId = `symbol-${Date.now()}-${placementGroupCounterRef.current++}`;
-        const placedStrokes = selectedSymbol.strokes.map((stroke) => ({
-          ...stroke,
-          points: stroke.points.map((symbolPoint) => ({
-            x: point.x + (symbolPoint.x - SYMBOL_CANVAS_SIZE / 2) * symbolScale,
-            y: point.y + (symbolPoint.y - SYMBOL_CANVAS_SIZE / 2) * symbolScale,
-          })),
-          width: Math.max(1 / coordinateScale, stroke.width * symbolScale),
-          groupId,
-        }));
-
-        setStrokes((current) => [...current, ...placedStrokes]);
-        setRedoStrokes([]);
-        placedStrokes.forEach(queueStrokeSave);
-        if (!repeatSymbolPlacement) onSymbolPlaced?.();
-        return;
-      }
-
-      if (isEditingSymbols) {
-        // Dice, tokens, and supplies render over the other board markers. Check
-        // their visible shapes first so drags begin on the item that was tapped.
-        const dieHit = findBoardTileAtPoint(
-          boardDieHitTargets,
-          point,
-          10 / (zoomRef.current * coordinateScale)
-        );
-        if (dieHit) {
-          setSelectedBoardDieId(dieHit.id);
-          setSelectedBoardTokenId(null);
-          setSelectedTokenSupplyId(null);
-          setSelectedBoardTilePlacementId(null);
-          setSelectedTileSnapPointId(null);
-          setSelectedDeckSpotId(null);
-          setSelectedImageId(null);
-          setSelectedGroupId(null);
-          tilePlacementDragSessionRef.current = null;
-          tileSnapDragSessionRef.current = null;
-          deckSpotDragSessionRef.current = null;
-          imageDragSessionRef.current = null;
-          symbolDragSessionRef.current = null;
-          const base = boardDiePlacements.find((item) => item.id === dieHit.id)!;
-          tokenMarkerDragSessionRef.current = {
-            kind: 'die', id: base.id, startPoint: point,
-            startX: base.x, startY: base.y, updatedX: base.x, updatedY: base.y, changed: false,
-          };
-          return;
-        }
-        const tokenHit = findBoardTileAtPoint(
-          boardTokenHitTargets,
-          point,
-          10 / (zoomRef.current * coordinateScale)
-        );
-        if (tokenHit) {
-          setSelectedBoardDieId(null);
-          setSelectedBoardTokenId(tokenHit.id);
-          setSelectedTokenSupplyId(null);
-          setSelectedBoardTilePlacementId(null);
-          setSelectedTileSnapPointId(null);
-          setSelectedDeckSpotId(null);
-          setSelectedImageId(null);
-          setSelectedGroupId(null);
-          tilePlacementDragSessionRef.current = null;
-          tileSnapDragSessionRef.current = null;
-          deckSpotDragSessionRef.current = null;
-          imageDragSessionRef.current = null;
-          symbolDragSessionRef.current = null;
-          const base = boardTokenPlacements.find((item) => item.id === tokenHit.id)!;
-          tokenMarkerDragSessionRef.current = {
-            kind: 'token', id: base.id, startPoint: point,
-            startX: base.x, startY: base.y, updatedX: base.x, updatedY: base.y, changed: false,
-          };
-          return;
-        }
-        const supplyHit = findBoardTileAtPoint(
-          tokenSupplyHitTargets,
-          point,
-          10 / (zoomRef.current * coordinateScale)
-        );
-        if (supplyHit) {
-          setSelectedBoardDieId(null);
-          setSelectedTokenSupplyId(supplyHit.id);
-          setSelectedBoardTokenId(null);
-          setSelectedBoardTilePlacementId(null);
-          setSelectedTileSnapPointId(null);
-          setSelectedDeckSpotId(null);
-          setSelectedImageId(null);
-          setSelectedGroupId(null);
-          tilePlacementDragSessionRef.current = null;
-          tileSnapDragSessionRef.current = null;
-          deckSpotDragSessionRef.current = null;
-          imageDragSessionRef.current = null;
-          symbolDragSessionRef.current = null;
-          const base = tokenSupplyPlacements.find((item) => item.id === supplyHit.id)!;
-          tokenMarkerDragSessionRef.current = {
-            kind: 'supply', id: base.id, startPoint: point,
-            startX: base.x, startY: base.y, updatedX: base.x, updatedY: base.y, changed: false,
-          };
-          return;
-        }
-        tokenMarkerDragSessionRef.current = null;
-        setSelectedBoardDieId(null);
-        setSelectedTokenSupplyId(null);
+    if (isEditingSymbols) {
+      // Dice, tokens, and supplies render over the other board markers. Check
+      // their visible shapes first so drags begin on the item that was tapped.
+      const dieHit = findBoardTileAtPoint(
+        boardDieHitTargets,
+        point,
+        10 / (zoomRef.current * coordinateScale)
+      );
+      if (dieHit) {
+        setSelectedBoardDieId(dieHit.id);
         setSelectedBoardTokenId(null);
-        const selectedBoardTile = findBoardTileAtPoint(
-          boardTilePlacements,
-          point,
-          10 / (zoomRef.current * coordinateScale)
-        );
-        if (selectedBoardTile) {
-          setSelectedBoardTilePlacementId(selectedBoardTile.id);
-          setSelectedTileSnapPointId(null);
-          setSelectedDeckSpotId(null);
-          setSelectedImageId(null);
-          setSelectedGroupId(null);
-          imageDragSessionRef.current = null;
-          symbolDragSessionRef.current = null;
-          deckSpotDragSessionRef.current = null;
-          tileSnapDragSessionRef.current = null;
-          tilePlacementDragSessionRef.current = {
-            placementId: selectedBoardTile.id,
-            basePlacement: selectedBoardTile,
-            updatedPlacement: selectedBoardTile,
-            startPoint: point,
-            changed: false,
-          };
-          setTilePlacementPreview({
-            tile: selectedBoardTile.tile,
-            deckId: selectedBoardTile.deckId,
-            deckName: selectedBoardTile.deckName,
-            tileCount: selectedBoardTile.tileCount,
-            faceUp: selectedBoardTile.faceUp,
-            x: selectedBoardTile.x,
-            y: selectedBoardTile.y,
-            orientation: selectedBoardTile.orientation,
-            snapped: tileSnapPoints.some((snapPoint) =>
-              Math.hypot(snapPoint.x - selectedBoardTile.x, snapPoint.y - selectedBoardTile.y) < 0.5
-            ),
-          });
-          return;
-        }
+        setSelectedTokenSupplyId(null);
         setSelectedBoardTilePlacementId(null);
-        tilePlacementDragSessionRef.current = null;
-        setTilePlacementPreview(null);
-        const selectedSnapPoint = [...tileSnapPoints].reverse().find((item) =>
-          Math.hypot(point.x - item.x, point.y - item.y) <= 16 / (zoomRef.current * coordinateScale)
-        );
-        if (selectedSnapPoint) {
-          setSelectedTileSnapPointId(selectedSnapPoint.id);
-          setSelectedBoardTilePlacementId(null);
-          setSelectedDeckSpotId(null);
-          setSelectedImageId(null);
-          setSelectedGroupId(null);
-          imageDragSessionRef.current = null;
-          symbolDragSessionRef.current = null;
-          deckSpotDragSessionRef.current = null;
-          tileSnapDragSessionRef.current = {
-            pointId: selectedSnapPoint.id,
-            basePoint: selectedSnapPoint,
-            updatedPoint: selectedSnapPoint,
-            startPoint: point,
-            changed: false,
-          };
-          return;
-        }
         setSelectedTileSnapPointId(null);
-        tileSnapDragSessionRef.current = null;
-        const selectedSpot = findDeckSpotAtPoint(
-          deckSpots,
-          point,
-          8 / (zoomRef.current * coordinateScale)
-        );
-        if (selectedSpot) {
-          setSelectedDeckSpotId(selectedSpot.id);
-          setSelectedBoardTilePlacementId(null);
-          setSelectedTileSnapPointId(null);
-          setSelectedImageId(null);
-          setSelectedGroupId(null);
-          imageDragSessionRef.current = null;
-          symbolDragSessionRef.current = null;
-          deckSpotDragSessionRef.current = {
-            spotId: selectedSpot.id,
-            baseSpot: selectedSpot,
-            updatedSpot: selectedSpot,
-            startPoint: point,
-            changed: false,
-          };
-          return;
-        }
-
         setSelectedDeckSpotId(null);
-        deckSpotDragSessionRef.current = null;
-        const selectedImage = findPlacedImageAtPoint(
-          placedImages,
-          point,
-          14 / (zoomRef.current * coordinateScale)
-        );
-        if (selectedImage) {
-          const center = selectedImage.center;
-          const handleTolerance = 16 / (zoomRef.current * coordinateScale);
-          const corners = [
-            { x: center.x - selectedImage.width / 2, y: center.y - selectedImage.height / 2 },
-            { x: center.x + selectedImage.width / 2, y: center.y - selectedImage.height / 2 },
-            { x: center.x + selectedImage.width / 2, y: center.y + selectedImage.height / 2 },
-            { x: center.x - selectedImage.width / 2, y: center.y + selectedImage.height / 2 },
-          ];
-          const startedOnHandle = corners.some(
-            (corner) => Math.hypot(point.x - corner.x, point.y - corner.y) <= handleTolerance
-          );
-
-          setSelectedImageId(selectedImage.id);
-          setSelectedBoardTilePlacementId(null);
-          setSelectedGroupId(null);
-          symbolDragSessionRef.current = null;
-          imageDragSessionRef.current = {
-            imageId: selectedImage.id,
-            baseImage: selectedImage,
-            updatedImage: selectedImage,
-            center,
-            startPoint: point,
-            resizeStartDistance: startedOnHandle
-              ? Math.max(1, Math.hypot(point.x - center.x, point.y - center.y))
-              : undefined,
-            changed: false,
-          };
-          return;
-        }
-
         setSelectedImageId(null);
+        setSelectedGroupId(null);
+        tilePlacementDragSessionRef.current = null;
+        tileSnapDragSessionRef.current = null;
+        deckSpotDragSessionRef.current = null;
         imageDragSessionRef.current = null;
-        setSelectedBoardTilePlacementId(null);
-        let symbolHitTargets = placedSymbolHitTargetsRef.current;
-        if (!symbolHitTargets || symbolHitTargets.strokes !== strokes) {
-          symbolHitTargets = { strokes, targets: buildPlacedSymbolHitTargets(strokes) };
-          placedSymbolHitTargetsRef.current = symbolHitTargets;
-        }
-        const selected = findPlacedSymbolAtPoint(
-          symbolHitTargets.targets,
-          point,
-          14 / (zoomRef.current * coordinateScale)
-        );
-
-        if (!selected) {
-          setSelectedGroupId(null);
-          setSelectedBoardTilePlacementId(null);
-          symbolDragSessionRef.current = null;
-          return;
-        }
-
-        setSelectedGroupId(selected.groupId);
-        setSelectedBoardTilePlacementId(null);
-        const center = {
-          x: (selected.bounds.left + selected.bounds.right) / 2,
-          y: (selected.bounds.top + selected.bounds.bottom) / 2,
+        symbolDragSessionRef.current = null;
+        const base = boardDiePlacements.find((item) => item.id === dieHit.id)!;
+        tokenMarkerDragSessionRef.current = {
+          kind: 'die', id: base.id, startPoint: point,
+          startX: base.x, startY: base.y, updatedX: base.x, updatedY: base.y, changed: false,
         };
+        return;
+      }
+      const tokenHit = findBoardTileAtPoint(
+        boardTokenHitTargets,
+        point,
+        10 / (zoomRef.current * coordinateScale)
+      );
+      if (tokenHit) {
+        setSelectedBoardDieId(null);
+        setSelectedBoardTokenId(tokenHit.id);
+        setSelectedTokenSupplyId(null);
+        setSelectedBoardTilePlacementId(null);
+        setSelectedTileSnapPointId(null);
+        setSelectedDeckSpotId(null);
+        setSelectedImageId(null);
+        setSelectedGroupId(null);
+        tilePlacementDragSessionRef.current = null;
+        tileSnapDragSessionRef.current = null;
+        deckSpotDragSessionRef.current = null;
+        imageDragSessionRef.current = null;
+        symbolDragSessionRef.current = null;
+        const base = boardTokenPlacements.find((item) => item.id === tokenHit.id)!;
+        tokenMarkerDragSessionRef.current = {
+          kind: 'token', id: base.id, startPoint: point,
+          startX: base.x, startY: base.y, updatedX: base.x, updatedY: base.y, changed: false,
+        };
+        return;
+      }
+      const supplyHit = findBoardTileAtPoint(
+        tokenSupplyHitTargets,
+        point,
+        10 / (zoomRef.current * coordinateScale)
+      );
+      if (supplyHit) {
+        setSelectedBoardDieId(null);
+        setSelectedTokenSupplyId(supplyHit.id);
+        setSelectedBoardTokenId(null);
+        setSelectedBoardTilePlacementId(null);
+        setSelectedTileSnapPointId(null);
+        setSelectedDeckSpotId(null);
+        setSelectedImageId(null);
+        setSelectedGroupId(null);
+        tilePlacementDragSessionRef.current = null;
+        tileSnapDragSessionRef.current = null;
+        deckSpotDragSessionRef.current = null;
+        imageDragSessionRef.current = null;
+        symbolDragSessionRef.current = null;
+        const base = tokenSupplyPlacements.find((item) => item.id === supplyHit.id)!;
+        tokenMarkerDragSessionRef.current = {
+          kind: 'supply', id: base.id, startPoint: point,
+          startX: base.x, startY: base.y, updatedX: base.x, updatedY: base.y, changed: false,
+        };
+        return;
+      }
+      tokenMarkerDragSessionRef.current = null;
+      setSelectedBoardDieId(null);
+      setSelectedTokenSupplyId(null);
+      setSelectedBoardTokenId(null);
+      const selectedBoardTile = findBoardTileAtPoint(
+        boardTilePlacements,
+        point,
+        10 / (zoomRef.current * coordinateScale)
+      );
+      if (selectedBoardTile) {
+        setSelectedBoardTilePlacementId(selectedBoardTile.id);
+        setActiveTileDragId(selectedBoardTile.id);
+        setSelectedTileSnapPointId(null);
+        setSelectedDeckSpotId(null);
+        setSelectedImageId(null);
+        setSelectedGroupId(null);
+        imageDragSessionRef.current = null;
+        symbolDragSessionRef.current = null;
+        deckSpotDragSessionRef.current = null;
+        tileSnapDragSessionRef.current = null;
+        tilePlacementDragSessionRef.current = {
+          placementId: selectedBoardTile.id,
+          basePlacement: selectedBoardTile,
+          updatedPlacement: selectedBoardTile,
+          startPoint: point,
+          changed: false,
+        };
+        setTilePlacementPreview({
+          tile: selectedBoardTile.tile,
+          deckId: selectedBoardTile.deckId,
+          deckName: selectedBoardTile.deckName,
+          tileCount: selectedBoardTile.tileCount,
+          faceUp: selectedBoardTile.faceUp,
+          x: selectedBoardTile.x,
+          y: selectedBoardTile.y,
+          orientation: selectedBoardTile.orientation,
+          snapped: tileSnapPoints.some((snapPoint) =>
+            Math.hypot(snapPoint.x - selectedBoardTile.x, snapPoint.y - selectedBoardTile.y) < 0.5
+          ),
+        });
+        return;
+      }
+      setSelectedBoardTilePlacementId(null);
+      tilePlacementDragSessionRef.current = null;
+      setTilePlacementPreview(null);
+      const selectedSnapPoint = [...tileSnapPoints].reverse().find((item) =>
+        Math.hypot(point.x - item.x, point.y - item.y) <= 16 / (zoomRef.current * coordinateScale)
+      );
+      if (selectedSnapPoint) {
+        setSelectedTileSnapPointId(selectedSnapPoint.id);
+        setSelectedBoardTilePlacementId(null);
+        setSelectedDeckSpotId(null);
+        setSelectedImageId(null);
+        setSelectedGroupId(null);
+        imageDragSessionRef.current = null;
+        symbolDragSessionRef.current = null;
+        deckSpotDragSessionRef.current = null;
+        tileSnapDragSessionRef.current = {
+          pointId: selectedSnapPoint.id,
+          basePoint: selectedSnapPoint,
+          updatedPoint: selectedSnapPoint,
+          startPoint: point,
+          changed: false,
+        };
+        return;
+      }
+      setSelectedTileSnapPointId(null);
+      tileSnapDragSessionRef.current = null;
+      const selectedSpot = findDeckSpotAtPoint(
+        deckSpots,
+        point,
+        8 / (zoomRef.current * coordinateScale)
+      );
+      if (selectedSpot) {
+        setSelectedDeckSpotId(selectedSpot.id);
+        setSelectedBoardTilePlacementId(null);
+        setSelectedTileSnapPointId(null);
+        setSelectedImageId(null);
+        setSelectedGroupId(null);
+        imageDragSessionRef.current = null;
+        symbolDragSessionRef.current = null;
+        deckSpotDragSessionRef.current = {
+          spotId: selectedSpot.id,
+          baseSpot: selectedSpot,
+          updatedSpot: selectedSpot,
+          startPoint: point,
+          changed: false,
+        };
+        return;
+      }
+
+      setSelectedDeckSpotId(null);
+      deckSpotDragSessionRef.current = null;
+      const selectedImage = findPlacedImageAtPoint(
+        placedImages,
+        point,
+        14 / (zoomRef.current * coordinateScale)
+      );
+      if (selectedImage) {
+        const center = selectedImage.center;
         const handleTolerance = 16 / (zoomRef.current * coordinateScale);
         const corners = [
-          { x: selected.bounds.left, y: selected.bounds.top },
-          { x: selected.bounds.right, y: selected.bounds.top },
-          { x: selected.bounds.right, y: selected.bounds.bottom },
-          { x: selected.bounds.left, y: selected.bounds.bottom },
+          { x: center.x - selectedImage.width / 2, y: center.y - selectedImage.height / 2 },
+          { x: center.x + selectedImage.width / 2, y: center.y - selectedImage.height / 2 },
+          { x: center.x + selectedImage.width / 2, y: center.y + selectedImage.height / 2 },
+          { x: center.x - selectedImage.width / 2, y: center.y + selectedImage.height / 2 },
         ];
         const startedOnHandle = corners.some(
-          (corner) =>
-            Math.hypot(point.x - corner.x, point.y - corner.y) <= handleTolerance
+          (corner) => Math.hypot(point.x - corner.x, point.y - corner.y) <= handleTolerance
         );
 
-        symbolDragSessionRef.current = {
-          groupId: selected.groupId,
-          baseStrokes: selected.strokes,
-          updatedStrokes: selected.strokes,
+        setSelectedImageId(selectedImage.id);
+        setSelectedBoardTilePlacementId(null);
+        setSelectedGroupId(null);
+        symbolDragSessionRef.current = null;
+        imageDragSessionRef.current = {
+          imageId: selectedImage.id,
+          baseImage: selectedImage,
+          updatedImage: selectedImage,
           center,
           startPoint: point,
           resizeStartDistance: startedOnHandle
-            ? Math.max(
-                1,
-                Math.hypot(point.x - center.x, point.y - center.y)
-              )
+            ? Math.max(1, Math.hypot(point.x - center.x, point.y - center.y))
             : undefined,
           changed: false,
         };
         return;
       }
 
-      const newStroke: Stroke = {
-        points: [point],
-        width: lineWidth / coordinateScale,
-        eraser: isErasing,
-        color: penColor,
+      setSelectedImageId(null);
+      imageDragSessionRef.current = null;
+      setSelectedBoardTilePlacementId(null);
+      let symbolHitTargets = placedSymbolHitTargetsRef.current;
+      if (!symbolHitTargets || symbolHitTargets.strokes !== strokes) {
+        symbolHitTargets = { strokes, targets: buildPlacedSymbolHitTargets(strokes) };
+        placedSymbolHitTargetsRef.current = symbolHitTargets;
+      }
+      const selected = findPlacedSymbolAtPoint(
+        symbolHitTargets.targets,
+        point,
+        14 / (zoomRef.current * coordinateScale)
+      );
+
+      if (!selected) {
+        setSelectedGroupId(null);
+        setSelectedBoardTilePlacementId(null);
+        symbolDragSessionRef.current = null;
+        return;
+      }
+
+      setSelectedGroupId(selected.groupId);
+      setSelectedBoardTilePlacementId(null);
+      const center = {
+        x: (selected.bounds.left + selected.bounds.right) / 2,
+        y: (selected.bounds.top + selected.bounds.bottom) / 2,
       };
+      const handleTolerance = 16 / (zoomRef.current * coordinateScale);
+      const corners = [
+        { x: selected.bounds.left, y: selected.bounds.top },
+        { x: selected.bounds.right, y: selected.bounds.top },
+        { x: selected.bounds.right, y: selected.bounds.bottom },
+        { x: selected.bounds.left, y: selected.bounds.bottom },
+      ];
+      const startedOnHandle = corners.some(
+        (corner) =>
+          Math.hypot(point.x - corner.x, point.y - corner.y) <= handleTolerance
+      );
 
-      draftRef.current = newStroke;
-      setDraft(newStroke);
-      latestDraftPointRef.current = point;
-      setEraserPosition(isErasing ? point : null);
-    },
+      symbolDragSessionRef.current = {
+        groupId: selected.groupId,
+        baseStrokes: selected.strokes,
+        updatedStrokes: selected.strokes,
+        center,
+        startPoint: point,
+        resizeStartDistance: startedOnHandle
+          ? Math.max(
+              1,
+              Math.hypot(point.x - center.x, point.y - center.y)
+            )
+          : undefined,
+        changed: false,
+      };
+      return;
+    }
 
-    onUpdate: ({ x, y }) => {
-      const placementPreview = tilePlacementSessionRef.current;
-      if (placementPreview) {
+    const newStroke: Stroke = {
+      points: [point],
+      width: lineWidth / coordinateScale,
+      eraser: isErasing,
+      color: penColor,
+    };
+
+    draftRef.current = newStroke;
+    setDraft(newStroke);
+    latestDraftPointRef.current = point;
+    setEraserPosition(isErasing ? point : null);
+  };
+
+  const handleDrawUpdate = (x: number, y: number) => {
+    // Gameplay tile movement is drawn directly from the UI-thread gesture.
+    // The JS gesture still handles selection and the final save, but it no
+    // longer recalculates a tile position for every finger sample.
+    if (gameplayMode && gameplayTileDragActiveRef.current) return;
+    const placementPreview = tilePlacementSessionRef.current;
+    if (placementPreview) {
+      const point = {
+        x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
+        y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
+      };
+      const snapThreshold = Math.max(24, Math.min(getBoardTileSize(placementPreview.tile).width, getBoardTileSize(placementPreview.tile).height) * 0.45);
+      const snapPoint = findNearestTileSnapPoint(tileSnapPoints, point, snapThreshold);
+      const updatedPreview = {
+        ...placementPreview,
+        x: snapPoint?.x ?? point.x,
+        y: snapPoint?.y ?? point.y,
+        orientation: snapPoint?.orientation ?? 0,
+        snapped: snapPoint !== null,
+      };
+      tilePlacementSessionRef.current = updatedPreview;
+      setTilePlacementPreview(updatedPreview);
+      return;
+    }
+    if (isEditingSymbols || gameplayMode) {
+      const deckCardSession = deckCardDragSessionRef.current;
+      if (gameplayMode && deckCardSession) {
         const point = {
           x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
           y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
         };
-        const snapThreshold = Math.max(24, Math.min(getBoardTileSize(placementPreview.tile).width, getBoardTileSize(placementPreview.tile).height) * 0.45);
-        const snapPoint = findNearestTileSnapPoint(tileSnapPoints, point, snapThreshold);
-        const updatedPreview = {
-          ...placementPreview,
-          x: snapPoint?.x ?? point.x,
-          y: snapPoint?.y ?? point.y,
-          orientation: snapPoint?.orientation ?? 0,
-          snapped: snapPoint !== null,
-        };
-        tilePlacementSessionRef.current = updatedPreview;
-        setTilePlacementPreview(updatedPreview);
+        deckCardSession.updatedPoint = point;
+        deckCardSession.screenY = y;
+        deckCardSession.changed = Math.hypot(
+          point.x - deckCardSession.startPoint.x,
+          point.y - deckCardSession.startPoint.y
+        ) > 8 / (zoomRef.current * coordinateScale);
         return;
       }
-      if (isEditingSymbols || gameplayMode) {
-        const deckCardSession = deckCardDragSessionRef.current;
-        if (gameplayMode && deckCardSession) {
-          const point = {
-            x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
-            y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
-          };
-          deckCardSession.updatedPoint = point;
-          deckCardSession.screenY = y;
-          deckCardSession.changed = Math.hypot(
-            point.x - deckCardSession.startPoint.x,
-            point.y - deckCardSession.startPoint.y
-          ) > 8 / (zoomRef.current * coordinateScale);
-          activePieceOffsetX.value = (point.x - deckCardSession.startPoint.x) * zoomRef.current * coordinateScale;
-          activePieceOffsetY.value = (point.y - deckCardSession.startPoint.y) * zoomRef.current * coordinateScale;
-          return;
+      const takeSession = gameplayTakeDragSessionRef.current;
+      if (gameplayMode && takeSession) {
+        const point = {
+          x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
+          y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
+        };
+        takeSession.updatedPoint = point;
+        takeSession.changed = Math.hypot(
+          point.x - takeSession.startPoint.x,
+          point.y - takeSession.startPoint.y
+        ) > 8 / (zoomRef.current * coordinateScale);
+        return;
+      }
+      const markerSession = tokenMarkerDragSessionRef.current;
+      if (markerSession) {
+        const point = {
+          x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
+          y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
+        };
+        const nextX = markerSession.startX + point.x - markerSession.startPoint.x;
+        const nextY = markerSession.startY + point.y - markerSession.startPoint.y;
+        markerSession.updatedX = nextX;
+        markerSession.updatedY = nextY;
+        markerSession.changed = Math.hypot(nextX - markerSession.startX, nextY - markerSession.startY) > 0.5;
+        if (gameplayMode && markerSession.kind === 'token') return;
+        // Gesture events can arrive faster than the screen can render. Keep
+        // only the latest point and redraw this marker at most once per frame.
+        // Re-rendering the complete canvas for every pointer event is costly
+        // on phones. Drawing at about 30 fps keeps pieces responsive while
+        // the final exact coordinate is still committed on release.
+        if (tokenMarkerRenderFrameRef.current === null && Date.now() - lastTokenMarkerRenderAtRef.current >= 32) {
+          tokenMarkerRenderFrameRef.current = requestAnimationFrame(() => {
+            tokenMarkerRenderFrameRef.current = null;
+            lastTokenMarkerRenderAtRef.current = Date.now();
+            const latest = tokenMarkerDragSessionRef.current;
+            if (!latest) return;
+            if (latest.kind === 'supply') {
+              setTokenSupplyPlacements((current) => current.map((item) => item.id === latest.id
+                ? { ...item, x: latest.updatedX, y: latest.updatedY } : item));
+            } else if (latest.kind === 'token') {
+              setBoardTokenPlacements((current) => current.map((item) => item.id === latest.id
+                ? { ...item, x: latest.updatedX, y: latest.updatedY } : item));
+            } else {
+              setBoardDiePlacements((current) => current.map((item) => item.id === latest.id
+                ? { ...item, x: latest.updatedX, y: latest.updatedY } : item));
+            }
+          });
         }
-        const takeSession = gameplayTakeDragSessionRef.current;
-        if (gameplayMode && takeSession) {
-          const point = {
-            x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
-            y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
-          };
-          takeSession.updatedPoint = point;
-          takeSession.changed = Math.hypot(
-            point.x - takeSession.startPoint.x,
-            point.y - takeSession.startPoint.y
-          ) > 8 / (zoomRef.current * coordinateScale);
-          activePieceOffsetX.value = (point.x - takeSession.startPoint.x) * zoomRef.current * coordinateScale;
-          activePieceOffsetY.value = (point.y - takeSession.startPoint.y) * zoomRef.current * coordinateScale;
-          return;
-        }
-        const markerSession = tokenMarkerDragSessionRef.current;
-        if (markerSession) {
-          const point = {
-            x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
-            y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
-          };
-          const nextX = markerSession.startX + point.x - markerSession.startPoint.x;
-          const nextY = markerSession.startY + point.y - markerSession.startPoint.y;
-          markerSession.updatedX = nextX;
-          markerSession.updatedY = nextY;
-          markerSession.changed = Math.hypot(nextX - markerSession.startX, nextY - markerSession.startY) > 0.5;
-          if (gameplayMode && markerSession.kind === 'token') {
-            activePieceOffsetX.value = (nextX - markerSession.startX) * zoomRef.current * coordinateScale;
-            activePieceOffsetY.value = (nextY - markerSession.startY) * zoomRef.current * coordinateScale;
-            return;
-          }
-          // Gesture events can arrive faster than the screen can render. Keep
-          // only the latest point and redraw this marker at most once per frame.
-          // Re-rendering the complete canvas for every pointer event is costly
-          // on phones. Drawing at about 30 fps keeps pieces responsive while
-          // the final exact coordinate is still committed on release.
-          if (tokenMarkerRenderFrameRef.current === null && Date.now() - lastTokenMarkerRenderAtRef.current >= 32) {
-            tokenMarkerRenderFrameRef.current = requestAnimationFrame(() => {
-              tokenMarkerRenderFrameRef.current = null;
-              lastTokenMarkerRenderAtRef.current = Date.now();
-              const latest = tokenMarkerDragSessionRef.current;
-              if (!latest) return;
-              if (latest.kind === 'supply') {
-                setTokenSupplyPlacements((current) => current.map((item) => item.id === latest.id
-                  ? { ...item, x: latest.updatedX, y: latest.updatedY } : item));
-              } else if (latest.kind === 'token') {
-                setBoardTokenPlacements((current) => current.map((item) => item.id === latest.id
-                  ? { ...item, x: latest.updatedX, y: latest.updatedY } : item));
-              } else {
-                setBoardDiePlacements((current) => current.map((item) => item.id === latest.id
-                  ? { ...item, x: latest.updatedX, y: latest.updatedY } : item));
-              }
-            });
-          }
-          return;
-        }
-        const tileSession = tilePlacementDragSessionRef.current;
-        if (tileSession) {
-          const point = {
-            x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
-            y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
-          };
-          const offset = {
-            x: point.x - tileSession.startPoint.x,
-            y: point.y - tileSession.startPoint.y,
-          };
-          const candidate = {
-            ...tileSession.basePlacement,
-            x: tileSession.basePlacement.x + offset.x,
-            y: tileSession.basePlacement.y + offset.y,
-          };
-          const tileSize = getBoardTileSize(candidate.tile);
-          const snapPoint = findNearestTileSnapPoint(
+        return;
+      }
+      const tileSession = tilePlacementDragSessionRef.current;
+      if (tileSession) {
+        const point = {
+          x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
+          y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
+        };
+        const offset = {
+          x: point.x - tileSession.startPoint.x,
+          y: point.y - tileSession.startPoint.y,
+        };
+        const candidate = {
+          ...tileSession.basePlacement,
+          x: tileSession.basePlacement.x + offset.x,
+          y: tileSession.basePlacement.y + offset.y,
+        };
+        const tileSize = gameplayMode ? null : getBoardTileSize(candidate.tile);
+        const snapPoint = tileSize
+          ? findNearestTileSnapPoint(
             tileSnapPoints,
             { x: candidate.x, y: candidate.y },
             Math.max(24, Math.min(tileSize.width, tileSize.height) * 0.45)
-          );
-          const updated = snapPoint
-            ? { ...candidate, x: snapPoint.x, y: snapPoint.y, orientation: snapPoint.orientation }
-            : candidate;
-          tileSession.updatedPlacement = updated;
-          tileSession.changed = Math.hypot(offset.x, offset.y) > 0.5 / (zoomRef.current * coordinateScale);
-          if (gameplayMode) {
-            activePieceOffsetX.value = (updated.x - tileSession.basePlacement.x) * zoomRef.current * coordinateScale;
-            activePieceOffsetY.value = (updated.y - tileSession.basePlacement.y) * zoomRef.current * coordinateScale;
-            activePieceRotation.value = updated.orientation;
-          } else if (Date.now() - lastTilePreviewRenderAtRef.current >= 32) {
-            lastTilePreviewRenderAtRef.current = Date.now();
-            setTilePlacementPreview({
-              tile: updated.tile,
-              deckId: updated.deckId,
-              deckName: updated.deckName,
-              tileCount: updated.tileCount,
-              faceUp: updated.faceUp,
-              x: updated.x,
-              y: updated.y,
-              orientation: updated.orientation,
-              snapped: snapPoint !== null,
+          )
+          : null;
+        const updated = snapPoint
+          ? { ...candidate, x: snapPoint.x, y: snapPoint.y, orientation: snapPoint.orientation }
+          : candidate;
+        tileSession.updatedPlacement = updated;
+        tileSession.changed = Math.hypot(offset.x, offset.y) > 0.5 / (zoomRef.current * coordinateScale);
+        if (!gameplayMode) {
+          // Editor drags reuse the same preview and snap behavior as tile placement.
+          pendingTilePreviewRef.current = {
+            tile: updated.tile,
+            deckId: updated.deckId,
+            deckName: updated.deckName,
+            tileCount: updated.tileCount,
+            faceUp: updated.faceUp,
+            x: updated.x,
+            y: updated.y,
+            orientation: updated.orientation,
+            snapped: snapPoint !== null,
+          };
+          if (tilePreviewRenderFrameRef.current === null) {
+            tilePreviewRenderFrameRef.current = requestAnimationFrame(() => {
+              tilePreviewRenderFrameRef.current = null;
+              const latestPreview = pendingTilePreviewRef.current;
+              pendingTilePreviewRef.current = null;
+              if (latestPreview && tilePlacementDragSessionRef.current) {
+                setTilePlacementPreview(latestPreview);
+              }
             });
           }
-          return;
         }
-        const snapSession = tileSnapDragSessionRef.current;
-        if (snapSession) {
-          const point = {
-            x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
-            y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
-          };
-          const offset = {
-            x: point.x - snapSession.startPoint.x,
-            y: point.y - snapSession.startPoint.y,
-          };
-          const updatedPoint = {
-            ...snapSession.basePoint,
-            x: snapSession.basePoint.x + offset.x,
-            y: snapSession.basePoint.y + offset.y,
-          };
-          snapSession.updatedPoint = updatedPoint;
-          snapSession.changed = Math.hypot(offset.x, offset.y) > 0.5 / (zoomRef.current * coordinateScale);
-          setTileSnapPoints((current) => current.map((item) => item.id === snapSession.pointId ? updatedPoint : item));
-          return;
-        }
-        const spotSession = deckSpotDragSessionRef.current;
-        if (spotSession) {
-          const point = {
-            x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
-            y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
-          };
-          const offset = {
-            x: point.x - spotSession.startPoint.x,
-            y: point.y - spotSession.startPoint.y,
-          };
-          const updatedSpot = {
-            ...spotSession.baseSpot,
-            x: spotSession.baseSpot.x + offset.x,
-            y: spotSession.baseSpot.y + offset.y,
-          };
-          spotSession.updatedSpot = updatedSpot;
-          spotSession.changed = Math.hypot(offset.x, offset.y) >
-            0.5 / (zoomRef.current * coordinateScale);
-          setDeckSpots((current) => current.map((spot) =>
-            spot.id === spotSession.spotId ? updatedSpot : spot
-          ));
-          return;
-        }
-
-        const imageSession = imageDragSessionRef.current;
-        if (imageSession) {
-          const point = {
-            x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
-            y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
-          };
-          let updatedImage: PlacedImage;
-
-          if (imageSession.resizeStartDistance !== undefined) {
-            const distance = Math.hypot(
-              point.x - imageSession.center.x,
-              point.y - imageSession.center.y
-            );
-            const scale = Math.max(
-              0.2,
-              Math.min(5, distance / imageSession.resizeStartDistance)
-            );
-            updatedImage = {
-              ...imageSession.baseImage,
-              width: imageSession.baseImage.width * scale,
-              height: imageSession.baseImage.height * scale,
-            };
-            imageSession.changed = Math.abs(scale - 1) > 0.01;
-          } else {
-            const offset = {
-              x: point.x - imageSession.startPoint.x,
-              y: point.y - imageSession.startPoint.y,
-            };
-            const moveThreshold = 0.5 / (zoomRef.current * coordinateScale);
-            if (
-              Math.abs(offset.x) < moveThreshold &&
-              Math.abs(offset.y) < moveThreshold
-            ) return;
-            updatedImage = {
-              ...imageSession.baseImage,
-              center: {
-                x: imageSession.baseImage.center.x + offset.x,
-                y: imageSession.baseImage.center.y + offset.y,
-              },
-            };
-            imageSession.changed = true;
-          }
-
-          imageSession.updatedImage = updatedImage;
-          setPlacedImages((current) => current.map((image) =>
-            image.id === imageSession.imageId ? updatedImage : image
-          ));
-          return;
-        }
-
-        const session = symbolDragSessionRef.current;
-        if (!session) return;
-
+        return;
+      }
+      const snapSession = tileSnapDragSessionRef.current;
+      if (snapSession) {
         const point = {
           x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
           y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
         };
-        if (session.resizeStartDistance !== undefined) {
+        const offset = {
+          x: point.x - snapSession.startPoint.x,
+          y: point.y - snapSession.startPoint.y,
+        };
+        const updatedPoint = {
+          ...snapSession.basePoint,
+          x: snapSession.basePoint.x + offset.x,
+          y: snapSession.basePoint.y + offset.y,
+        };
+        snapSession.updatedPoint = updatedPoint;
+        snapSession.changed = Math.hypot(offset.x, offset.y) > 0.5 / (zoomRef.current * coordinateScale);
+        scheduleMovePreview(() => {
+          const latest = tileSnapDragSessionRef.current;
+          if (latest?.pointId !== snapSession.pointId) return;
+          const latestPoint = latest.updatedPoint;
+          setTileSnapPoints((current) => current.map((item) =>
+            item.id === latest.pointId ? latestPoint : item
+          ));
+        });
+        return;
+      }
+      const spotSession = deckSpotDragSessionRef.current;
+      if (spotSession) {
+        const point = {
+          x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
+          y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
+        };
+        const offset = {
+          x: point.x - spotSession.startPoint.x,
+          y: point.y - spotSession.startPoint.y,
+        };
+        const updatedSpot = {
+          ...spotSession.baseSpot,
+          x: spotSession.baseSpot.x + offset.x,
+          y: spotSession.baseSpot.y + offset.y,
+        };
+        spotSession.updatedSpot = updatedSpot;
+        spotSession.changed = Math.hypot(offset.x, offset.y) >
+          0.5 / (zoomRef.current * coordinateScale);
+        scheduleMovePreview(() => {
+          const latest = deckSpotDragSessionRef.current;
+          if (latest?.spotId !== spotSession.spotId) return;
+          const latestSpot = latest.updatedSpot;
+          setDeckSpots((current) => current.map((spot) =>
+            spot.id === latest.spotId ? latestSpot : spot
+          ));
+        });
+        return;
+      }
+
+      const imageSession = imageDragSessionRef.current;
+      if (imageSession) {
+        const point = {
+          x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
+          y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
+        };
+        let updatedImage: PlacedImage;
+
+        if (imageSession.resizeStartDistance !== undefined) {
+          const distance = Math.hypot(
+            point.x - imageSession.center.x,
+            point.y - imageSession.center.y
+          );
+          const scale = Math.max(
+            0.2,
+            Math.min(5, distance / imageSession.resizeStartDistance)
+          );
+          updatedImage = {
+            ...imageSession.baseImage,
+            width: imageSession.baseImage.width * scale,
+            height: imageSession.baseImage.height * scale,
+          };
+          imageSession.changed = Math.abs(scale - 1) > 0.01;
+        } else {
+          const offset = {
+            x: point.x - imageSession.startPoint.x,
+            y: point.y - imageSession.startPoint.y,
+          };
+          const moveThreshold = 0.5 / (zoomRef.current * coordinateScale);
+          if (
+            Math.abs(offset.x) < moveThreshold &&
+            Math.abs(offset.y) < moveThreshold
+          ) return;
+          updatedImage = {
+            ...imageSession.baseImage,
+            center: {
+              x: imageSession.baseImage.center.x + offset.x,
+              y: imageSession.baseImage.center.y + offset.y,
+            },
+          };
+          imageSession.changed = true;
+        }
+
+        imageSession.updatedImage = updatedImage;
+        scheduleMovePreview(() => {
+          const latest = imageDragSessionRef.current;
+          if (latest?.imageId !== imageSession.imageId) return;
+          const latestImage = latest.updatedImage;
+          setPlacedImages((current) => current.map((image) =>
+            image.id === latest.imageId ? latestImage : image
+          ));
+        });
+        return;
+      }
+
+      const session = symbolDragSessionRef.current;
+      if (!session) return;
+
+      const point = {
+        x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
+        y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
+      };
+      if (session.resizeStartDistance !== undefined) {
+        scheduleMovePreview(() => {
+          if (symbolDragSessionRef.current !== session) return;
           const currentDistance = Math.hypot(
             point.x - session.center.x,
             point.y - session.center.y
           );
           const scale = Math.max(
             0.25,
-            Math.min(4, currentDistance / session.resizeStartDistance)
+            Math.min(4, currentDistance / session.resizeStartDistance!)
           );
           const resizedStrokes = transformSymbolStrokes(
             session.baseStrokes,
@@ -3535,25 +4056,27 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           );
           session.updatedStrokes = resizedStrokes;
           session.changed = Math.abs(scale - 1) > 0.01;
-          if (session.changed) setRedoStrokes([]);
-
+          if (session.changed) setRedoStrokes((current) => current.length ? [] : current);
           setStrokes((current) => [
             ...current.filter((stroke) => stroke.groupId !== session.groupId),
             ...resizedStrokes,
           ]);
-          return;
-        }
+        });
+        return;
+      }
 
-        const offset = {
-          x: point.x - session.startPoint.x,
-          y: point.y - session.startPoint.y,
-        };
-        const moveThreshold = 0.5 / (zoomRef.current * coordinateScale);
-        if (
-          Math.abs(offset.x) < moveThreshold &&
-          Math.abs(offset.y) < moveThreshold
-        ) return;
+      const offset = {
+        x: point.x - session.startPoint.x,
+        y: point.y - session.startPoint.y,
+      };
+      const moveThreshold = 0.5 / (zoomRef.current * coordinateScale);
+      if (
+        Math.abs(offset.x) < moveThreshold &&
+        Math.abs(offset.y) < moveThreshold
+      ) return;
 
+      scheduleMovePreview(() => {
+        if (symbolDragSessionRef.current !== session) return;
         const movedStrokes = transformSymbolStrokes(
           session.baseStrokes,
           session.center,
@@ -3563,89 +4086,237 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         );
         session.updatedStrokes = movedStrokes;
         session.changed = true;
-        setRedoStrokes([]);
+        setRedoStrokes((current) => current.length ? [] : current);
 
-        // Moving a symbol brings its complete stroke group to the front of the map.
+        // Moving a symbol brings its complete stroke group to the front.
         setStrokes((current) => [
           ...current.filter((stroke) => stroke.groupId !== session.groupId),
           ...movedStrokes,
         ]);
-        return;
+      });
+      return;
+    }
+
+    const current = draftRef.current;
+    if (!current) return;
+
+    const point = {
+      x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
+      y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
+    };
+
+    const lastPoint = current.points[current.points.length - 1];
+    const minDistance = 2 / (zoomRef.current * coordinateScale);
+
+    const dx = point.x - lastPoint.x;
+    const dy = point.y - lastPoint.y;
+
+    if (dx * dx + dy * dy < minDistance * minDistance) {
+      if (current.eraser) {
+        latestDraftPointRef.current = point;
+        scheduleDraftRender(false);
       }
+      return;
+    }
 
-      const current = draftRef.current;
-      if (!current) return;
+    current.points.push(point);
+    latestDraftPointRef.current = point;
+    scheduleDraftRender();
 
-      const point = {
-        x: (x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
-        y: (y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
+    // Keep every accepted point, but avoid rebuilding the visible path more than once
+    // per animation frame when the gesture reports updates faster than the display.
+  };
+
+  const handleDrawFinalize = (finalTouch?: { x: number; y: number } | null) => {
+    // Gameplay drags no longer send every pointer event to JavaScript. Update
+    // only the final board point here before committing the appropriate move.
+    if (gameplayMode && finalTouch) {
+      const finalPoint = {
+        x: (finalTouch.x - boardOffsetRef.current.x) / zoomRef.current / coordinateScale,
+        y: (finalTouch.y - boardOffsetRef.current.y) / zoomRef.current / coordinateScale,
       };
-  
-      const lastPoint = current.points[current.points.length - 1];
-      const minDistance = 2 / (zoomRef.current * coordinateScale);
-
-      const dx = point.x - lastPoint.x;
-      const dy = point.y - lastPoint.y;
-
-      if (dx * dx + dy * dy < minDistance * minDistance) {
-        if (current.eraser) {
-          latestDraftPointRef.current = point;
-          scheduleDraftRender(false);
-        }
-        return;
-      }
-
-      current.points.push(point);
-      latestDraftPointRef.current = point;
-      scheduleDraftRender();
-
-      // Keep every accepted point, but avoid rebuilding the visible path more than once
-      // per animation frame when the gesture reports updates faster than the display.
-    },
-
-    onFinalize: () => {
       const deckCardSession = deckCardDragSessionRef.current;
-      deckCardDragSessionRef.current = null;
-      setDeckCardDragPreview(null);
-      activePieceOffsetX.value = 0;
-      activePieceOffsetY.value = 0;
-      if (gameplayMode && deckCardSession?.changed) {
-        const targetSpot = findDeckSpotAtPoint(
-          deckSpots,
-          deckCardSession.updatedPoint,
-          16 / (zoomRef.current * coordinateScale)
-        );
-        rootViewRef.current?.measureInWindow((_originX, originY) => {
-          onDeckCardDragRequest?.(
-            deckCardSession.sourceSpotId,
-            targetSpot?.id ?? null,
-            originY + deckCardSession.screenY
-          );
-        });
+      if (deckCardSession) {
+        deckCardSession.updatedPoint = finalPoint;
+        deckCardSession.screenY = finalTouch.y;
+        deckCardSession.changed = Math.hypot(
+          finalPoint.x - deckCardSession.startPoint.x,
+          finalPoint.y - deckCardSession.startPoint.y
+        ) > 8 / (zoomRef.current * coordinateScale);
       }
       const takeSession = gameplayTakeDragSessionRef.current;
-      gameplayTakeDragSessionRef.current = null;
-      if (gameplayMode) {
-        setGameplayTakePreview(null);
-        if (takeSession?.changed) {
-          if (takeSession.kind === 'token') {
-            void takeGameplayTokenFromSupply(takeSession.updatedPoint, takeSession.sourceId);
-          } else {
-            void takeGameplayTileFromDeck(takeSession.updatedPoint, takeSession.sourceId);
-          }
+      if (takeSession) {
+        takeSession.updatedPoint = finalPoint;
+        takeSession.changed = Math.hypot(
+          finalPoint.x - takeSession.startPoint.x,
+          finalPoint.y - takeSession.startPoint.y
+        ) > 8 / (zoomRef.current * coordinateScale);
+      }
+      const tokenSession = tokenMarkerDragSessionRef.current;
+      if (tokenSession) {
+        tokenSession.updatedX = tokenSession.startX + finalPoint.x - tokenSession.startPoint.x;
+        tokenSession.updatedY = tokenSession.startY + finalPoint.y - tokenSession.startPoint.y;
+        tokenSession.changed = Math.hypot(
+          tokenSession.updatedX - tokenSession.startX,
+          tokenSession.updatedY - tokenSession.startY
+        ) > 0.5;
+      }
+      const tileSession = tilePlacementDragSessionRef.current;
+      if (tileSession) {
+        // Only count movement after the finger actually leaves its starting
+        // point; a stationary tap must not relocate a tile to the touch spot.
+        tileSession.changed = Math.hypot(
+          finalPoint.x - tileSession.startPoint.x,
+          finalPoint.y - tileSession.startPoint.y
+        ) > 8 / (zoomRef.current * coordinateScale);
+        if (tileSession.changed) {
+          tileSession.updatedPlacement = {
+            ...tileSession.basePlacement,
+            x: finalPoint.x,
+            y: finalPoint.y,
+          };
         }
       }
-      if (tilePlacementSessionRef.current) {
-        finishTilePlacementPreview();
-      } else if (isEditingSymbols || gameplayMode) {
-        finishTokenMarkerDrag();
-        finishBoardTileDrag();
-        finishImageDrag();
-        finishSnapPointDrag();
-        finishDeckSpotDrag();
-        finishSymbolDrag();
+    }
+    flushMovePreview();
+    const deckCardSession = deckCardDragSessionRef.current;
+    deckCardDragSessionRef.current = null;
+    pendingDeckCardDragPreviewRef.current = null;
+    setDeckCardDragPreview(null);
+    if (deckCardSession) {
+      activePieceOffsetX.value = 0;
+      activePieceOffsetY.value = 0;
+    }
+    if (gameplayMode && deckCardSession?.changed) {
+      const targetSpot = findDeckSpotAtPoint(
+        deckSpots,
+        deckCardSession.updatedPoint,
+        16 / (zoomRef.current * coordinateScale)
+      );
+      rootViewRef.current?.measureInWindow((_originX, originY) => {
+        onDeckCardDragRequest?.(
+          deckCardSession.sourceSpotId,
+          targetSpot?.id ?? null,
+          originY + deckCardSession.screenY
+        );
+      });
+    }
+    const takeSession = gameplayTakeDragSessionRef.current;
+    gameplayTakeDragSessionRef.current = null;
+    pendingGameplayTakePreviewRef.current = null;
+    if (gameplayMode) {
+      setGameplayTakePreview(null);
+      if (takeSession) {
+        activePieceOffsetX.value = 0;
+        activePieceOffsetY.value = 0;
+      }
+      if (takeSession?.changed) {
+        if (takeSession.kind === 'token') {
+          void takeGameplayTokenFromSupply(takeSession.updatedPoint, takeSession.sourceId);
+        } else {
+          void takeGameplayTileFromDeck(takeSession.updatedPoint, takeSession.sourceId);
+        }
+      }
+    }
+    if (tilePlacementSessionRef.current) {
+      finishTilePlacementPreview();
+    } else if (isEditingSymbols || gameplayMode) {
+      finishTokenMarkerDrag();
+      const tileSession = tilePlacementDragSessionRef.current;
+      const finalTilePosition = gameplayMode && finalTouch && tileSession?.changed
+        ? {
+          x: tileSession.updatedPlacement.x,
+          y: tileSession.updatedPlacement.y,
+          orientation: tileSession.basePlacement.orientation,
+        }
+        : null;
+      finishBoardTileDrag(finalTilePosition);
+      finishImageDrag();
+      finishSnapPointDrag();
+      finishDeckSpotDrag();
+      finishSymbolDrag();
+    } else {
+      finishStroke();
+    }
+    // Keep the live gesture data available until tile release has copied
+    // its final UI-thread position into the saved placement.
+    gameplayTileDragActiveRef.current = false;
+    drawGestureRunOnJS.value = !gameplayMode;
+  };
+
+  const drawGesture = usePanGesture({
+    minPointers: 1,
+    maxPointers: 1,
+    // Keep gameplay tile movement on the UI runtime during the drag. Other
+    // modes keep their existing JS handlers, scheduled only as needed.
+    runOnJS: drawGestureRunOnJS,
+    activateAfterLongPress: 0,
+    onBegin: (event) => {
+      'worklet';
+      gameplayDragStartLocal.value = { x: event.x, y: event.y };
+      if (gameplayMode) {
+        // Start each touch with a clean drag kind. This prevents a quick
+        // second move from inheriting the previous piece's live transform.
+        gameplayPieceDragKind.value = 0;
+        gameplayDragHasMoved.value = false;
+        gameplayDragPreviewRequested.value = false;
+        activePieceOffsetX.value = 0;
+        activePieceOffsetY.value = 0;
+        gameplayLastTouchX.value = event.x;
+        gameplayLastTouchY.value = event.y;
+      }
+      if (global._WORKLET) scheduleOnRN(handleDrawBegin, event.x, event.y);
+      else handleDrawBegin(event.x, event.y);
+    },
+    onUpdate: (event) => {
+      'worklet';
+      if (global._WORKLET && gameplayMode) {
+        gameplayLastTouchX.value = event.x;
+        gameplayLastTouchY.value = event.y;
+
+        if (gameplayPieceDragKind.value === 1) {
+          const scale = gameplayPieceScale.value;
+          // Both hit testing and object layout use this drawing surface's
+          // local coordinate space, so use its local touch delta here too.
+          const dragX = event.x - gameplayDragStartLocal.value.x;
+          const dragY = event.y - gameplayDragStartLocal.value.y;
+          gameplayDragHasMoved.value = true;
+          gameplayTileTransform.value = {
+            x: (gameplayPieceBase.value.x - gameplayTileOriginalCenter.value.x) * scale + dragX,
+            y: (gameplayPieceBase.value.y - gameplayTileOriginalCenter.value.y) * scale + dragY,
+            rotation: gameplayPieceBase.value.orientation,
+          };
+        } else if (gameplayPieceDragKind.value === 2) {
+          // The active object follows the finger natively. JS only needs the
+          // final coordinate to decide whether the drop is valid.
+          gameplayDragHasMoved.value = true;
+          if (!gameplayDragPreviewRequested.value) {
+            gameplayDragPreviewRequested.value = true;
+            scheduleOnRN(showGameplayDragPreview);
+          }
+          activePieceOffsetX.value = event.x - gameplayDragStartLocal.value.x;
+          activePieceOffsetY.value = event.y - gameplayDragStartLocal.value.y;
+        }
+        return;
+      }
+      if (global._WORKLET) {
+        scheduleOnRN(handleDrawUpdate, event.x, event.y);
       } else {
-        finishStroke();
+        handleDrawUpdate(event.x, event.y);
+      }
+    },
+    onFinalize: () => {
+      'worklet';
+      if (global._WORKLET) {
+        const finalTouch = gameplayMode
+          ? { x: gameplayLastTouchX.value, y: gameplayLastTouchY.value }
+          : null;
+        // The final point is captured above, so a following drag can safely
+        // begin with an empty kind even if JavaScript is still saving this one.
+        gameplayPieceDragKind.value = 0;
+        scheduleOnRN(handleDrawFinalize, finalTouch);
+      } else {
+        handleDrawFinalize();
       }
     },
   });
@@ -3653,93 +4324,133 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   const boardPanGesture = usePanGesture({
     minPointers: 2,
     maxPointers: 2,
-    runOnJS: true,
+    enabled: !isEditingSymbols,
+    runOnJS: false,
 
-    onActivate: (event) => {
-      panStartRef.current = {
-        x: boardOffsetRef.current.x - event.translationX,
-        y: boardOffsetRef.current.y - event.translationY,
-      };
+    onActivate: () => {
+      'worklet';
+      if (isEditingSymbols) return;
+      canvasPanActiveOnUI.value = true;
+      scheduleOnRN(beginCanvasTransformGesture);
     },
 
     onUpdate: (event) => {
-      if (isEditingSymbols) return;
-      updateBoardOffset(
-        panStartRef.current.x + event.translationX,
-        panStartRef.current.y + event.translationY
-      );
+      'worklet';
+      if (isEditingSymbols || !canvasPanActiveOnUI.value || canvasPinchActiveOnUI.value) return;
+      canvasPanOffsetX.value = event.translationX;
+      canvasPanOffsetY.value = event.translationY;
+    },
+
+    onFinalize: () => {
+      'worklet';
+      if (!canvasPanActiveOnUI.value) return;
+      canvasPanActiveOnUI.value = false;
+      scheduleOnRN(finishCanvasTransformGesture);
     },
   });
 
   const zoomGesture = usePinchGesture({
-    runOnJS: true,
+    enabled: !isEditingSymbols,
+    runOnJS: false,
 
-    onActivate: () => {
-      if (isEditingSymbols) {
-        const selectedImage = placedImages.find(
-          (image) => image.id === selectedImageId
-        );
-        if (selectedImage) {
-          imagePinchSessionRef.current = {
-            imageId: selectedImage.id,
-            baseImage: selectedImage,
-            updatedImage: selectedImage,
-            center: selectedImage.center,
-            startPoint: { x: 0, y: 0 },
-            changed: false,
-          };
-          symbolPinchSessionRef.current = null;
-          return;
-        }
-
-        const groupStrokes = selectedGroupId
-          ? strokes.filter((stroke) => stroke.groupId === selectedGroupId)
-          : [];
-        const bounds = getStrokeBounds(groupStrokes);
-
-        if (!selectedGroupId || !bounds) {
-          symbolPinchSessionRef.current = null;
-          return;
-        }
-
-        symbolPinchSessionRef.current = {
-          groupId: selectedGroupId,
-          baseStrokes: groupStrokes,
-          updatedStrokes: groupStrokes,
-          center: {
-            x: (bounds.left + bounds.right) / 2,
-            y: (bounds.top + bounds.bottom) / 2,
-          },
-          startPoint: { x: 0, y: 0 },
-          changed: false,
-        };
-        return;
-      }
-
-      pinchStartRef.current = zoomRef.current;
+    onActivate: (event) => {
+      'worklet';
+      if (isEditingSymbols) return;
+      canvasPinchActiveOnUI.value = true;
+      canvasPinchStartFocalX.value = event.focalX;
+      canvasPinchStartFocalY.value = event.focalY;
+      scheduleOnRN(beginCanvasTransformGesture);
     },
 
     onUpdate: (event) => {
-      if (isEditingSymbols) {
-        const imageSession = imagePinchSessionRef.current;
-        if (imageSession) {
-          const scale = Math.max(0.2, Math.min(5, event.scale));
-          const updatedImage = {
-            ...imageSession.baseImage,
-            width: imageSession.baseImage.width * scale,
-            height: imageSession.baseImage.height * scale,
-          };
-          imageSession.updatedImage = updatedImage;
-          imageSession.changed = Math.abs(scale - 1) > 0.01;
+      'worklet';
+      if (isEditingSymbols || !canvasPinchActiveOnUI.value) return;
+      const baseZoom = canvasBaseZoomOnUI.value;
+      const nextZoom = Math.max(
+        0.5,
+        Math.min(3, baseZoom * event.scale)
+      );
+      const scale = nextZoom / baseZoom;
+      canvasGestureScale.value = scale;
+      canvasPinchOffsetX.value = event.focalX - scale * canvasPinchStartFocalX.value
+        + (scale - 1) * canvasPanOffsetX.value;
+      canvasPinchOffsetY.value = event.focalY - scale * canvasPinchStartFocalY.value
+        + (scale - 1) * canvasPanOffsetY.value;
+    },
+
+    onFinalize: () => {
+      'worklet';
+      if (!canvasPinchActiveOnUI.value) return;
+      canvasPinchActiveOnUI.value = false;
+      scheduleOnRN(finishCanvasTransformGesture);
+    },
+  });
+
+  // Pinching an image or symbol still needs JavaScript hit-testing and state
+  // updates. Keep that editor-only gesture separate so board zoom stays UI-only.
+  const editPinchGesture = usePinchGesture({
+    enabled: isEditingSymbols,
+    runOnJS: true,
+    onActivate: () => {
+      const selectedImage = placedImages.find((image) => image.id === selectedImageId);
+      if (selectedImage) {
+        imagePinchSessionRef.current = {
+          imageId: selectedImage.id,
+          baseImage: selectedImage,
+          updatedImage: selectedImage,
+          center: selectedImage.center,
+          startPoint: { x: 0, y: 0 },
+          changed: false,
+        };
+        symbolPinchSessionRef.current = null;
+        return;
+      }
+
+      const groupStrokes = selectedGroupId
+        ? strokes.filter((stroke) => stroke.groupId === selectedGroupId)
+        : [];
+      const bounds = getStrokeBounds(groupStrokes);
+      if (!selectedGroupId || !bounds) {
+        symbolPinchSessionRef.current = null;
+        return;
+      }
+      symbolPinchSessionRef.current = {
+        groupId: selectedGroupId,
+        baseStrokes: groupStrokes,
+        updatedStrokes: groupStrokes,
+        center: {
+          x: (bounds.left + bounds.right) / 2,
+          y: (bounds.top + bounds.bottom) / 2,
+        },
+        startPoint: { x: 0, y: 0 },
+        changed: false,
+      };
+    },
+    onUpdate: (event) => {
+      const imageSession = imagePinchSessionRef.current;
+      if (imageSession) {
+        const scale = Math.max(0.2, Math.min(5, event.scale));
+        const updatedImage = {
+          ...imageSession.baseImage,
+          width: imageSession.baseImage.width * scale,
+          height: imageSession.baseImage.height * scale,
+        };
+        imageSession.updatedImage = updatedImage;
+        imageSession.changed = Math.abs(scale - 1) > 0.01;
+        scheduleMovePreview(() => {
+          const latest = imagePinchSessionRef.current;
+          if (latest?.imageId !== imageSession.imageId) return;
           setPlacedImages((current) => current.map((image) =>
-            image.id === imageSession.imageId ? updatedImage : image
+            image.id === latest.imageId ? latest.updatedImage : image
           ));
-          return;
-        }
+        });
+        return;
+      }
 
-        const session = symbolPinchSessionRef.current;
-        if (!session) return;
-
+      const session = symbolPinchSessionRef.current;
+      if (!session) return;
+      scheduleMovePreview(() => {
+        if (symbolPinchSessionRef.current !== session) return;
         const scale = Math.max(0.25, Math.min(4, event.scale));
         const resizedStrokes = transformSymbolStrokes(
           session.baseStrokes,
@@ -3750,38 +4461,25 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         );
         session.updatedStrokes = resizedStrokes;
         session.changed = Math.abs(scale - 1) > 0.01;
-        if (session.changed) {
-          setRedoStrokes([]);
-        }
-
+        if (session.changed) setRedoStrokes((current) => current.length ? [] : current);
         setStrokes((current) => [
           ...current.filter((stroke) => stroke.groupId !== session.groupId),
           ...resizedStrokes,
         ]);
-        return;
-      }
-
-      const nextZoom = Math.max(
-        0.5,
-        Math.min(3, pinchStartRef.current * event.scale)
-      );
-
-      zoomRef.current = nextZoom;
-      setZoom(nextZoom);
+      });
     },
-
     onFinalize: () => {
-      if (isEditingSymbols) {
-        finishImagePinch();
-        finishSymbolPinch();
-      }
+      flushMovePreview();
+      finishImagePinch();
+      finishSymbolPinch();
     },
   });
 
   const canvasGesture = useSimultaneousGestures(
     drawGesture,
     boardPanGesture,
-    zoomGesture
+    zoomGesture,
+    editPinchGesture
   );
 
   // renderStroke takes a stroke object and converts it into a visible Skia path.
@@ -3973,9 +4671,12 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       <Animated.View
         key={`board-token-${placement.id}`}
         pointerEvents="none"
+        renderToHardwareTextureAndroid={isBeingDragged}
+        shouldRasterizeIOS={isBeingDragged}
         style={[{
           position: 'absolute', left, top, width, height,
-          zIndex: selected ? 10 : 8, elevation: selected ? 10 : 8,
+          zIndex: isBeingDragged ? 50 : selected ? 10 : 8,
+          elevation: isBeingDragged ? 50 : selected ? 10 : 8,
         }, isBeingDragged && activePieceDragStyle]}
       >
         <View style={[{
@@ -4010,71 +4711,29 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   };
 
   const renderBoardTilePlacement = (
-    placement: { id?: number; x: number; y: number; orientation: number; faceUp: boolean; tile: BoardTileVisual | null; deckId: number | null; deckName: string | null; tileCount: number },
+    placement: (BoardTilePlacement | TilePlacementPreview) & { id?: number },
     ghost = false,
-    selected = false
+    selected = false,
+    dragging = false,
+    animatedDrag = false
   ) => {
-    const transformScale = zoom * coordinateScale;
-    const tileSize = getBoardTileSize(placement.tile);
-    const width = placement.tile ? tileSize.width * transformScale : 92 * transformScale;
-    const height = placement.tile ? tileSize.height * transformScale : 56 * transformScale;
-    const left = placement.x * transformScale + boardOffset.x - width / 2;
-    const top = placement.y * transformScale + boardOffset.y - height / 2;
-    const isGameplayDragPreview = gameplayMode && ghost && activeGameplayDragKey !== null
-      && activeGameplayDragKey.startsWith('tile-');
     return (
-      <Animated.View
-        key={ghost ? 'tile-placement-ghost' : `board-tile-placement-${placement.id}`}
-        pointerEvents="none"
-        style={[
-          drawingCanvasStyles.boardTilePlacement,
-          selected && drawingCanvasStyles.selectedBoardTilePlacement,
-          {
-            left,
-            top,
-            width,
-            height,
-            opacity: ghost && !isGameplayDragPreview ? 0.55 : 1,
-          },
-          isGameplayDragPreview && activePieceDragStyle,
-        ]}
-      >
-        <View style={{
-          width, height, alignItems: 'center', justifyContent: 'center',
-          transform: isGameplayDragPreview ? [] : [{ rotate: `${placement.orientation}deg` }],
-        }}>
-        {placement.deckId !== null && placement.tile && (
-          (placement.tile.shape === 'square' || placement.tile.shape === 'circle') && (
-            <View style={[
-              drawingCanvasStyles.tileDeckStackLayer,
-              { width, height, borderRadius: placement.tile.shape === 'circle' ? Math.max(width, height) / 2 : 0 },
-            ]} />
-          )
-        )}
-        {placement.tile ? (
-          <BoardTileArtworkPreview
-            tile={placement.tile}
-            width={width}
-            height={height}
-            faceUp={placement.faceUp}
-            selected={selected}
-          />
-        ) : (
-          <View style={[drawingCanvasStyles.emptyTileDeck, selected && drawingCanvasStyles.selectedEmptyTileDeck]}>
-            <Text numberOfLines={1} style={drawingCanvasStyles.emptyTileDeckName}>{placement.deckName ?? 'Tile deck'}</Text>
-            <Text style={drawingCanvasStyles.emptyTileDeckCount}>{placement.tileCount} tiles</Text>
-          </View>
-        )}
-        {placement.deckId !== null && placement.tile && (
-          <View style={drawingCanvasStyles.tileDeckCountBadge}>
-            <Text style={drawingCanvasStyles.tileDeckCountText}>{placement.tileCount}</Text>
-          </View>
-        )}
-        {ghost && tilePlacementPreview?.snapped && (
-          <View style={drawingCanvasStyles.snappedTileBadge}><Text style={drawingCanvasStyles.snappedTileBadgeText}>Snap</Text></View>
-        )}
-        </View>
-      </Animated.View>
+      <BoardTilePlacementView
+        key={ghost
+          ? placement.id !== undefined ? `tile-placement-drag-${placement.id}` : 'tile-placement-ghost'
+          : `board-tile-placement-${placement.id}`}
+        placement={placement}
+        transformScale={zoom * coordinateScale}
+        offsetX={boardOffset.x}
+        offsetY={boardOffset.y}
+        selected={selected}
+        ghost={ghost}
+        dragging={dragging}
+        animatedDrag={animatedDrag}
+        snapped={ghost && Boolean(tilePlacementPreview?.snapped)}
+        gameplayTilePositionStyle={gameplayTilePositionStyle}
+        gameplayTileRotationStyle={gameplayTileRotationStyle}
+      />
     );
   };
 
@@ -4114,6 +4773,15 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
               style={StyleSheet.absoluteFill}
             />
           )}
+          {/* Keep all map artwork in one animated layer. Panning and zooming
+              then update a single native transform instead of recalculating
+              every stroke and piece layout on each touch event. */}
+          <Animated.View
+            pointerEvents="none"
+            renderToHardwareTextureAndroid={isCanvasTransforming}
+            shouldRasterizeIOS={isCanvasTransforming}
+            style={[StyleSheet.absoluteFill, canvasTransformStyle]}
+          >
           <Canvas style={StyleSheet.absoluteFill}>
             <Group
               transform={[
@@ -4186,55 +4854,17 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           })}
 
           {/* This card-shaped marker uses its saved rotation as the deck's facing. */}
-          {deckSpots.map((spot) => {
-            const transformScale = zoom * coordinateScale;
-            const cardSize = getDeckSpotSize(spot);
-            const markerWidth = cardSize.width * transformScale;
-            const markerHeight = cardSize.height * transformScale;
-            const left = spot.x * transformScale + boardOffset.x - markerWidth / 2;
-            const top = spot.y * transformScale + boardOffset.y - markerHeight / 2;
-            const isSelected = isEditingSymbols && spot.id === selectedDeckSpotId;
-            const cardPreviewSurface = spot.topCard
-              ? spot.faceUp
-                ? spot.topCard.frontSurfaceId
-                : spot.topCard.backSurfaceId ?? spot.topCard.frontSurfaceId
-              : null;
-
-            return (
-              <View
-                key={`deck-spot-${spot.id}`}
-                pointerEvents="none"
-                style={[
-                  drawingCanvasStyles.deckSpotMarker,
-                  isSelected && drawingCanvasStyles.selectedDeckSpotMarker,
-                  {
-                    left,
-                    top,
-                    width: markerWidth,
-                    height: markerHeight,
-                    transform: [{ rotate: `${spot.orientation}deg` }],
-                  },
-                ]}
-              >
-                {cardPreviewSurface && spot.topCard ? (
-                  <DeckSpotCardPreview
-                    surfaceId={cardPreviewSurface}
-                    width={markerWidth - 4}
-                    height={markerHeight - 4}
-                    cardWidth={spot.topCard.widthInches}
-                    cardHeight={spot.topCard.heightInches}
-                  />
-                ) : (
-                  <Text style={drawingCanvasStyles.emptyDeckSpotLabel}>Empty</Text>
-                )}
-                {gameplayMode && (
-                  <View style={drawingCanvasStyles.tileDeckCountBadge}>
-                    <Text style={drawingCanvasStyles.tileDeckCountText}>{spot.cardCount}</Text>
-                  </View>
-                )}
-              </View>
-            );
-          })}
+          {deckSpots.map((spot) => (
+            <DeckSpotMarkerView
+              key={`deck-spot-${spot.id}`}
+              spot={spot}
+              transformScale={zoom * coordinateScale}
+              offsetX={boardOffset.x}
+              offsetY={boardOffset.y}
+              selected={isEditingSymbols && spot.id === selectedDeckSpotId}
+              gameplayMode={gameplayMode}
+            />
+          ))}
 
           {/* A dragged card follows the finger while the physical pile remains in place. */}
           {gameplayMode && deckCardDragPreview?.spot.topCard && (() => {
@@ -4252,10 +4882,13 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
             return (
               <Animated.View
                 pointerEvents="none"
+                renderToHardwareTextureAndroid
+                shouldRasterizeIOS
                 style={[
                   drawingCanvasStyles.deckSpotMarker,
                   { position: 'absolute', left, top, width, height, zIndex: 20, elevation: 8, opacity: 0.92 },
                   activePieceDragStyle,
+                  gameplayDragPreviewStyle,
                 ]}
               >
                 <DeckSpotCardPreview
@@ -4299,14 +4932,19 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           })}
 
           {boardTilePlacements
-            .filter((placement) => !(gameplayMode && activeGameplayDragKey === `tile-${placement.id}`))
             .map((placement) => renderBoardTilePlacement(
-            placement,
-            false,
-            ((isEditingSymbols || gameplayMode) && placement.id === selectedBoardTilePlacementId)
-              || (gameplayMode && placement.deckId === gameplayTileDeckChoice)
+              placement,
+              false,
+              (isEditingSymbols || gameplayMode) && placement.id === selectedBoardTilePlacementId,
+              gameplayMode && placement.id === activeTileDragId,
+              gameplayMode && placement.id === activeTileDragId
           ))}
-          {tilePlacementPreview && renderBoardTilePlacement(tilePlacementPreview, true)}
+          {tilePlacementPreview && renderBoardTilePlacement(
+            tilePlacementPreview,
+            true,
+            activeTileDragId !== null,
+            activeTileDragId !== null
+          )}
           {gameplayMode && gameplayTakePreview && (() => {
             const scale = zoom * coordinateScale;
             const size = getBoardTileSize(gameplayTakePreview.tile);
@@ -4315,20 +4953,21 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
             return (
               <Animated.View
                 pointerEvents="none"
+                renderToHardwareTextureAndroid
+                shouldRasterizeIOS
                 style={[{
                   position: 'absolute',
                   left: gameplayTakePreview.startPoint.x * scale + boardOffset.x - width / 2,
                   top: gameplayTakePreview.startPoint.y * scale + boardOffset.y - height / 2,
                   width, height, opacity: 0.78, zIndex: 20, elevation: 20,
-                }, activePieceDragStyle]}
+                }, activePieceDragStyle, gameplayDragPreviewStyle]}
               >
                 <BoardTileArtworkPreview tile={gameplayTakePreview.tile} width={width} height={height} faceUp />
               </Animated.View>
             );
           })()}
           {tokenSupplyPlacements.map((placement) => renderTokenSupplyPlacement(
-            placement, (isEditingSymbols && placement.id === selectedTokenSupplyId)
-              || (gameplayMode && placement.id === gameplayTokenSupplyChoice)
+            placement, isEditingSymbols && placement.id === selectedTokenSupplyId
           ))}
           {boardTokenPlacements.map((placement) => renderBoardTokenPlacement(
             placement, (isEditingSymbols || gameplayMode) && placement.id === selectedBoardTokenId
@@ -4379,7 +5018,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
               </>
             );
           })()}
-
+          </Animated.View>
         </View>
       </GestureDetector>
 
@@ -4395,7 +5034,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         </Canvas>
       )}
 
-      {placementSymbolId !== undefined && (
+      {!gameplayMode && placementSymbolId !== undefined && (
         <View style={drawingCanvasStyles.placementHint}>
           <Text style={drawingCanvasStyles.placementHintText}>
             {placementSymbolData?.id !== placementSymbolId
@@ -4417,7 +5056,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         </View>
       )}
 
-      {placementDeckSpot !== undefined && (
+      {!gameplayMode && placementDeckSpot !== undefined && (
         <View style={drawingCanvasStyles.placementHint}>
           <Text style={drawingCanvasStyles.placementHintText}>
             {placementDeckSpot.spotType === 'deck'
@@ -4435,7 +5074,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         </View>
       )}
 
-      {placementTileSnapPoint && (
+      {!gameplayMode && placementTileSnapPoint && (
         <View style={drawingCanvasStyles.placementHint}>
           <Text style={drawingCanvasStyles.placementHintText}>Tap the map to add oriented tile snap points. Tap Done when finished.</Text>
           <Pressable
@@ -4449,7 +5088,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         </View>
       )}
 
-      {placementTokenSupply && (
+      {!gameplayMode && placementTokenSupply && (
         <View style={drawingCanvasStyles.placementHint}>
           <Text style={drawingCanvasStyles.placementHintText}>
             Tap the map to place {placementTokenSupply.token.name} supplies multiple times.
@@ -4465,7 +5104,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         </View>
       )}
 
-      {placementToken && (
+      {!gameplayMode && placementToken && (
         <View style={drawingCanvasStyles.placementHint}>
           <Text style={drawingCanvasStyles.placementHintText}>
             Tap the map to place {placementToken.name} tokens multiple times.
@@ -4481,7 +5120,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         </View>
       )}
 
-      {placementDie && (
+      {!gameplayMode && placementDie && (
         <View style={drawingCanvasStyles.placementHint}>
           <Text style={drawingCanvasStyles.placementHintText}>
             Tap the board to place {placementDie.name} showing side 1. Use Move to change the side shown.
@@ -4497,7 +5136,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         </View>
       )}
 
-      {(placementTile !== undefined || placementTileDeck !== undefined) && (
+      {!gameplayMode && (placementTile !== undefined || placementTileDeck !== undefined) && (
         <View style={drawingCanvasStyles.placementHint}>
           <Text style={drawingCanvasStyles.placementHintText}>
             {placementTileDeck
@@ -4511,23 +5150,6 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
             onPress={() => onCancelTilePlacement?.()}
           >
             <Text>Done</Text>
-          </Pressable>
-        </View>
-      )}
-
-      {gameplayMode && gameplayTakePreview === null && gameplayTokenSupplyChoice !== null && (
-        <View style={[drawingCanvasStyles.placementHint, { top: topInset + 98, zIndex: 60, elevation: 60 }]}>
-          <Text style={drawingCanvasStyles.placementHintText}>Tap a destination, or drag directly from the supply to place one token.</Text>
-          <Pressable accessibilityRole="button" style={drawingCanvasStyles.placementCancelButton} onPress={() => setGameplayTokenSupplyChoice(null)}>
-            <Text>Cancel</Text>
-          </Pressable>
-        </View>
-      )}
-      {gameplayMode && gameplayTakePreview === null && gameplayTileDeckChoice !== null && (
-        <View style={[drawingCanvasStyles.placementHint, { top: topInset + 98, zIndex: 60, elevation: 60 }]}>
-          <Text style={drawingCanvasStyles.placementHintText}>Tap a destination, or drag directly from the deck to place its next tile.</Text>
-          <Pressable accessibilityRole="button" style={drawingCanvasStyles.placementCancelButton} onPress={() => setGameplayTileDeckChoice(null)}>
-            <Text>Cancel</Text>
           </Pressable>
         </View>
       )}
@@ -4898,6 +5520,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
                         hex,
                         surfaceId
                       );
+                      invalidateSurfaceArtworkCache(surfaceId);
                     }, 'Could not save board background color:');
                   }
                 }
@@ -4923,33 +5546,127 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
 });
 
 // Renders a saved tile face at its physical shape and aspect ratio on the board.
+type BoardTilePlacementVisual = (BoardTilePlacement | TilePlacementPreview) & { id?: number };
+
+const BoardTilePlacementView = memo(function BoardTilePlacementView({
+  placement,
+  transformScale,
+  offsetX,
+  offsetY,
+  selected,
+  ghost,
+  dragging,
+  animatedDrag,
+  snapped,
+  gameplayTilePositionStyle,
+  gameplayTileRotationStyle,
+}: {
+  placement: BoardTilePlacementVisual;
+  transformScale: number;
+  offsetX: number;
+  offsetY: number;
+  selected: boolean;
+  ghost: boolean;
+  dragging: boolean;
+  animatedDrag: boolean;
+  snapped: boolean;
+  gameplayTilePositionStyle: ReturnType<typeof useAnimatedStyle>;
+  gameplayTileRotationStyle: ReturnType<typeof useAnimatedStyle>;
+}) {
+  const tileSize = getBoardTileSize(placement.tile);
+  const width = placement.tile ? tileSize.width * transformScale : 92 * transformScale;
+  const height = placement.tile ? tileSize.height * transformScale : 56 * transformScale;
+  const left = placement.x * transformScale + offsetX - width / 2;
+  const top = placement.y * transformScale + offsetY - height / 2;
+
+  return (
+    <Animated.View
+      pointerEvents="none"
+      renderToHardwareTextureAndroid={animatedDrag}
+      shouldRasterizeIOS={animatedDrag}
+      style={[
+        drawingCanvasStyles.boardTilePlacement,
+        selected && drawingCanvasStyles.selectedBoardTilePlacement,
+        { left, top, width, height, opacity: ghost && !dragging ? 0.55 : 1 },
+        dragging && { zIndex: 50, elevation: 50 },
+        animatedDrag && gameplayTilePositionStyle,
+      ]}
+    >
+      <Animated.View style={[{
+        width, height, alignItems: 'center', justifyContent: 'center',
+      }, animatedDrag
+        ? gameplayTileRotationStyle
+        : { transform: [{ rotate: `${placement.orientation}deg` }] }]}>
+        {placement.deckId !== null && placement.tile
+          && (placement.tile.shape === 'square' || placement.tile.shape === 'circle') && (
+            <View style={[
+              drawingCanvasStyles.tileDeckStackLayer,
+              { width, height, borderRadius: placement.tile.shape === 'circle' ? Math.max(width, height) / 2 : 0 },
+            ]} />
+          )}
+        {placement.tile ? (
+          <BoardTileArtworkPreview
+            tile={placement.tile}
+            width={width}
+            height={height}
+            faceUp={placement.faceUp}
+            selected={selected}
+          />
+        ) : (
+          <View style={[drawingCanvasStyles.emptyTileDeck, selected && drawingCanvasStyles.selectedEmptyTileDeck]}>
+            <Text numberOfLines={1} style={drawingCanvasStyles.emptyTileDeckName}>{placement.deckName ?? 'Tile deck'}</Text>
+            <Text style={drawingCanvasStyles.emptyTileDeckCount}>{placement.tileCount} tiles</Text>
+          </View>
+        )}
+        {placement.deckId !== null && placement.tile && (
+          <View style={drawingCanvasStyles.tileDeckCountBadge}>
+            <Text style={drawingCanvasStyles.tileDeckCountText}>{placement.tileCount}</Text>
+          </View>
+        )}
+        {ghost && snapped && (
+          <View style={drawingCanvasStyles.snappedTileBadge}><Text style={drawingCanvasStyles.snappedTileBadgeText}>Snap</Text></View>
+        )}
+      </Animated.View>
+    </Animated.View>
+  );
+});
+
 export const BoardTileArtworkPreview = memo(function BoardTileArtworkPreview({
   tile,
   width,
   height,
   faceUp,
   selected = false,
+  showOutline = true,
+  drawErasers = true,
 }: {
   tile: BoardTileVisual;
   width: number;
   height: number;
   faceUp: boolean;
   selected?: boolean;
+  showOutline?: boolean;
+  drawErasers?: boolean;
 }) {
   const db = useSQLiteContext();
+  const canvasRef = useCanvasRef();
   const artworkSurfaceId = !faceUp && tile.backSurfaceId
     ? tile.backSurfaceId
     : tile.frontSurfaceId;
+  const rasterVariant = `${tile.shape}|${tile.widthInches}|${tile.heightInches}|${tile.color}|erasers:${Number(drawErasers)}`;
+  const rasterKey = `${artworkSurfaceId}|${rasterVariant}`;
   const [artwork, setArtwork] = useState<{
     backgroundColor: string;
     backgroundImage: { base64Data: string; mimeType: string } | null;
     strokes: Stroke[];
     images: PlacedImage[];
   } | null>(null);
+  const [flattenedArtwork, setFlattenedArtwork] = useState<SkImage | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     setArtwork(null);
+    setFlattenedArtwork(null);
     const loadArtwork = async () => {
       try {
         const loaded = await loadSurfaceArtwork(db, artworkSurfaceId);
@@ -4958,9 +5675,70 @@ export const BoardTileArtworkPreview = memo(function BoardTileArtworkPreview({
         console.error('Could not load tile artwork for the board:', error);
       }
     };
-    void loadArtwork();
+    void loadCachedSurfaceRaster(db, rasterKey, artworkSurfaceId, rasterVariant).then((cachedRaster) => {
+      if (cancelled) return;
+      if (cachedRaster) setFlattenedArtwork(cachedRaster);
+      else void loadArtwork();
+    });
     return () => { cancelled = true; };
-  }, [artworkSurfaceId, db, tile.color]);
+  }, [artworkSurfaceId, db, rasterKey, rasterVariant, tile.color]);
+
+  useEffect(() => {
+    if (flattenedArtwork) return;
+    const cached = getCachedSurfaceRaster(rasterKey);
+    if (cached) {
+      setFlattenedArtwork(cached);
+      return;
+    }
+    return subscribeToSurfaceRaster(rasterKey, setFlattenedArtwork);
+  }, [flattenedArtwork, rasterKey]);
+
+  useEffect(() => {
+    if (!artwork || flattenedArtwork || pendingSurfaceRasterCaptures.has(rasterKey)) return;
+    pendingSurfaceRasterCaptures.add(rasterKey);
+    let cancelled = false;
+    let firstFrame = 0;
+    let secondFrame = 0;
+    const generationAtStart = surfaceArtworkGenerations.get(artworkSurfaceId) ?? 0;
+    // Let Skia paint the full face once, then retain a single image for every
+    // later placement and drag. The source strokes remain editable in SQLite.
+    firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        void canvasRef.current?.makeImageSnapshotAsync().then((image) => {
+          if (cancelled || (surfaceArtworkGenerations.get(artworkSurfaceId) ?? 0) !== generationAtStart) return;
+          cacheSurfaceRaster(rasterKey, image);
+          const pngBytes = image.encodeToBytes(ImageFormat.PNG);
+          void db.runAsync(
+            `INSERT INTO surface_artwork_rasters
+              (surface_id, variant, png_data, pixel_width, pixel_height, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(surface_id, variant) DO UPDATE SET
+               png_data = excluded.png_data,
+               pixel_width = excluded.pixel_width,
+               pixel_height = excluded.pixel_height,
+               updated_at = excluded.updated_at`,
+            artworkSurfaceId,
+            rasterVariant,
+            pngBytes,
+            image.width(),
+            image.height(),
+            Date.now()
+          ).catch((error) => console.warn('Could not save cached surface artwork:', artworkSurfaceId, error));
+          setFlattenedArtwork(image);
+          setArtwork(null);
+        }).catch(() => {
+          // If the platform cannot snapshot this frame, keep drawing the live
+          // Skia scene. The next mount can retry without affecting editing.
+        }).finally(() => pendingSurfaceRasterCaptures.delete(rasterKey));
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(firstFrame);
+      cancelAnimationFrame(secondFrame);
+      pendingSurfaceRasterCaptures.delete(rasterKey);
+    };
+  }, [artwork, artworkSurfaceId, canvasRef, db, flattenedArtwork, rasterKey, rasterVariant]);
 
   const pixelScale = width / tile.widthInches;
   const tileShapePath = useMemo(() => {
@@ -4989,7 +5767,9 @@ export const BoardTileArtworkPreview = memo(function BoardTileArtworkPreview({
   // lets the polygon mask clip it transparently instead of painting the board
   // color into the corners (which could cover an adjacent tile underneath).
   const decodedArtwork = useMemo(() => {
-    if (!artwork) return null;
+    if (!artwork || flattenedArtwork) return null;
+    const cached = tileArtworkImageCache.get(artwork.images);
+    if (cached) return cached;
     const decode = (base64Data: string) => {
       try {
         return Skia.Image.MakeImageFromEncoded(Skia.Data.fromBase64(base64Data));
@@ -4998,16 +5778,25 @@ export const BoardTileArtworkPreview = memo(function BoardTileArtworkPreview({
         return null;
       }
     };
-    return {
+    const decoded: DecodedTileArtwork = {
       backgroundImage: artwork.backgroundImage ? decode(artwork.backgroundImage.base64Data) : null,
       images: artwork.images.map((image) => ({ ...image, decoded: decode(image.base64Data) })),
     };
-  }, [artwork]);
+    tileArtworkImageCache.set(artwork.images, decoded);
+    return decoded;
+  }, [artwork, flattenedArtwork]);
   // Build saved paths once per artwork load instead of rebuilding all tile
   // strokes whenever a neighboring piece or board control re-renders.
   const artworkStrokePaths = useMemo(
-    () => artwork?.strokes.map((stroke) => pointsToPath(stroke.points)) ?? [],
-    [artwork?.strokes]
+    () => {
+       if (!artwork || flattenedArtwork) return [];
+      const cached = tileArtworkPathCache.get(artwork.strokes);
+      if (cached) return cached;
+      const paths = artwork.strokes.map((stroke) => pointsToPath(stroke.points));
+      tileArtworkPathCache.set(artwork.strokes, paths);
+      return paths;
+    },
+    [artwork?.strokes, flattenedArtwork]
   );
 
   const outlineColor = selected ? '#315EFB' : '#4B5563';
@@ -5017,57 +5806,57 @@ export const BoardTileArtworkPreview = memo(function BoardTileArtworkPreview({
       height,
       backgroundColor: 'transparent',
     }}>
-      <Canvas style={StyleSheet.absoluteFill}>
-        <Mask mask={<Path path={tileShapePath} color="#FFFFFF" />} mode="alpha">
-          <Rect x={0} y={0} width={width} height={height} color={artwork?.backgroundColor ?? tile.color} />
-          {decodedArtwork?.backgroundImage && (
-            <SkiaImage
-              image={decodedArtwork.backgroundImage}
-              x={0}
-              y={0}
-              width={width}
-              height={height}
-              fit="cover"
-            />
-          )}
-        </Mask>
+      <Canvas ref={canvasRef} style={StyleSheet.absoluteFill}>
+        {flattenedArtwork ? (
+          <SkiaImage image={flattenedArtwork} x={0} y={0} width={width} height={height} fit="fill" />
+        ) : (
+          <Mask mask={<Path path={tileShapePath} color="#FFFFFF" />} mode="alpha">
+            <Group>
+              <Rect x={0} y={0} width={width} height={height} color={artwork?.backgroundColor ?? tile.color} />
+              {decodedArtwork?.backgroundImage && (
+                <SkiaImage
+                  image={decodedArtwork.backgroundImage}
+                  x={0}
+                  y={0}
+                  width={width}
+                  height={height}
+                  fit="cover"
+                />
+              )}
+              <Group transform={[{ scale: pixelScale }]}>
+                {artwork?.strokes.map((stroke, index) => !drawErasers && stroke.eraser ? null : (
+                  <Path
+                    key={`board-tile-stroke-${tile.id}-${index}`}
+                    path={artworkStrokePaths[index]}
+                    color={stroke.color}
+                    style="stroke"
+                    strokeWidth={stroke.width}
+                    strokeCap="round"
+                    strokeJoin="round"
+                    blendMode={stroke.eraser ? 'clear' : 'srcOver'}
+                  />
+                ))}
+              </Group>
+              {decodedArtwork?.images.map((image) => image.decoded && (
+                <SkiaImage
+                  key={`board-tile-image-${image.id}`}
+                  image={image.decoded}
+                  x={(image.center.x - image.width / 2) * pixelScale}
+                  y={(image.center.y - image.height / 2) * pixelScale}
+                  width={image.width * pixelScale}
+                  height={image.height * pixelScale}
+                  fit="contain"
+                />
+              ))}
+            </Group>
+          </Mask>
+        )}
       </Canvas>
-      <Canvas style={StyleSheet.absoluteFill}>
-        <Mask mask={<Path path={tileShapePath} color="#FFFFFF" />} mode="alpha">
-          <Group transform={[{ scale: pixelScale }]}>
-            {artwork?.strokes.map((stroke, index) => (
-              <Path
-                key={`board-tile-stroke-${tile.id}-${index}`}
-                path={artworkStrokePaths[index]}
-                color={stroke.color}
-                style="stroke"
-                strokeWidth={stroke.width}
-                strokeCap="round"
-                strokeJoin="round"
-                blendMode={stroke.eraser ? 'clear' : 'srcOver'}
-              />
-            ))}
-          </Group>
-        </Mask>
-      </Canvas>
-      <Canvas style={StyleSheet.absoluteFill}>
-        <Mask mask={<Path path={tileShapePath} color="#FFFFFF" />} mode="alpha">
-          {decodedArtwork?.images.map((image) => image.decoded && (
-            <SkiaImage
-              key={`board-tile-image-${image.id}`}
-              image={image.decoded}
-              x={(image.center.x - image.width / 2) * pixelScale}
-              y={(image.center.y - image.height / 2) * pixelScale}
-              width={image.width * pixelScale}
-              height={image.height * pixelScale}
-              fit="contain"
-            />
-          ))}
-        </Mask>
-      </Canvas>
-      <Canvas pointerEvents="none" style={StyleSheet.absoluteFill}>
-        <Path path={tileShapePath} color={outlineColor} style="stroke" strokeWidth={selected ? 2.5 : 1.5} />
-      </Canvas>
+      {showOutline && (
+        <Canvas pointerEvents="none" style={StyleSheet.absoluteFill}>
+          <Path path={tileShapePath} color={outlineColor} style="stroke" strokeWidth={selected ? 2.5 : 1.5} />
+        </Canvas>
+      )}
     </View>
   );
 });
@@ -5087,100 +5876,87 @@ const DeckSpotCardPreview = memo(function DeckSpotCardPreview({
   cardWidth: number;
   cardHeight: number;
 }) {
-  const db = useSQLiteContext();
-  const [artwork, setArtwork] = useState<{
-    backgroundColor: string;
-    backgroundImage: { data: string; mimeType: string } | null;
-    strokes: Stroke[];
-    images: PlacedImage[];
-  } | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setArtwork(null);
-    const loadArtwork = async () => {
-      try {
-        const loaded = await loadSurfaceArtwork(db, surfaceId);
-        if (!cancelled) {
-          setArtwork({
-            backgroundColor: loaded.backgroundColor ?? '#FFFFFF',
-            backgroundImage: loaded.backgroundImage
-              ? { data: loaded.backgroundImage.base64Data, mimeType: loaded.backgroundImage.mimeType }
-              : null,
-            strokes: loaded.strokes,
-            images: loaded.images,
-          });
-        }
-      } catch (error) {
-        console.error('Could not load the card shown on a deck spot:', error);
-      }
-    };
-    void loadArtwork();
-    return () => {
-      cancelled = true;
-    };
-  }, [db, surfaceId]);
-
-  const scale = Math.min(width / cardWidth, height / cardHeight);
-  const offsetX = (width - cardWidth * scale) / 2;
-  const offsetY = (height - cardHeight * scale) / 2;
-  const cardStrokePaths = useMemo(
-    () => artwork?.strokes.map((stroke) => pointsToPath(stroke.points)) ?? [],
-    [artwork?.strokes]
+  const cardTile: BoardTileVisual = {
+    id: -1,
+    name: 'Card face',
+    shape: 'square',
+    widthInches: cardWidth,
+    heightInches: cardHeight,
+    color: '#FFFFFF',
+    frontSurfaceId: surfaceId,
+    backSurfaceId: null,
+  };
+  return (
+    <BoardTileArtworkPreview
+      tile={cardTile}
+      width={width}
+      height={height}
+      faceUp
+      showOutline={false}
+      drawErasers={false}
+    />
   );
+});
+
+// Most pile markers are unchanged after a draw. Memoizing each marker means a
+// draw only rerenders its source/destination preview and count badge.
+const DeckSpotMarkerView = memo(function DeckSpotMarkerView({
+  spot,
+  transformScale,
+  offsetX,
+  offsetY,
+  selected,
+  gameplayMode,
+}: {
+  spot: DeckSpot;
+  transformScale: number;
+  offsetX: number;
+  offsetY: number;
+  selected: boolean;
+  gameplayMode: boolean;
+}) {
+  const cardSize = getDeckSpotSize(spot);
+  const markerWidth = cardSize.width * transformScale;
+  const markerHeight = cardSize.height * transformScale;
+  const left = spot.x * transformScale + offsetX - markerWidth / 2;
+  const top = spot.y * transformScale + offsetY - markerHeight / 2;
+  const previewSurfaceId = spot.topCard
+    ? spot.faceUp
+      ? spot.topCard.frontSurfaceId
+      : spot.topCard.backSurfaceId ?? spot.topCard.frontSurfaceId
+    : null;
 
   return (
     <View
       pointerEvents="none"
       style={[
-        StyleSheet.absoluteFill,
-        { backgroundColor: artwork?.backgroundColor ?? '#FFFFFF' },
+        drawingCanvasStyles.deckSpotMarker,
+        selected && drawingCanvasStyles.selectedDeckSpotMarker,
+        {
+          left,
+          top,
+          width: markerWidth,
+          height: markerHeight,
+          transform: [{ rotate: `${spot.orientation}deg` }],
+        },
       ]}
     >
-      {artwork?.backgroundImage && (
-        <Image
-          source={{ uri: `data:${artwork.backgroundImage.mimeType};base64,${artwork.backgroundImage.data}` }}
-          resizeMode="cover"
-          style={StyleSheet.absoluteFill}
+      {previewSurfaceId && spot.topCard ? (
+        <DeckSpotCardPreview
+          surfaceId={previewSurfaceId}
+          width={markerWidth - 4}
+          height={markerHeight - 4}
+          cardWidth={spot.topCard.widthInches}
+          cardHeight={spot.topCard.heightInches}
         />
+      ) : (
+        <Text style={drawingCanvasStyles.emptyDeckSpotLabel}>Empty</Text>
       )}
-      <Canvas style={StyleSheet.absoluteFill}>
-        <Group transform={[
-          { translateX: offsetX },
-          { translateY: offsetY },
-          { scale },
-        ]}>
-          {artwork?.strokes.map((stroke, index) => stroke.eraser ? null : (
-            <Path
-              key={`deck-card-stroke-${index}`}
-              path={cardStrokePaths[index]}
-              color={stroke.color}
-              style="stroke"
-              strokeWidth={stroke.width}
-              strokeCap="round"
-              strokeJoin="round"
-            />
-          ))}
-        </Group>
-      </Canvas>
-      {artwork?.images.map((image) => {
-        const imageWidth = image.width * scale;
-        const imageHeight = image.height * scale;
-        return (
-          <Image
-            key={`deck-card-image-${image.id}`}
-            source={{ uri: `data:${image.mimeType};base64,${image.base64Data}` }}
-            resizeMode="contain"
-            style={{
-              position: 'absolute',
-              left: offsetX + image.center.x * scale - imageWidth / 2,
-              top: offsetY + image.center.y * scale - imageHeight / 2,
-              width: imageWidth,
-              height: imageHeight,
-            }}
-          />
-        );
-      })}
+      {gameplayMode && (
+        <View style={drawingCanvasStyles.tileDeckCountBadge}>
+          <Text style={drawingCanvasStyles.tileDeckCountText}>{spot.cardCount}</Text>
+        </View>
+      )}
     </View>
   );
 });
