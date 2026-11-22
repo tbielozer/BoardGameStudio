@@ -11,731 +11,76 @@ import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanima
 import { scheduleOnRN } from 'react-native-worklets';
 import type { HostInstance } from 'react-native';
 import type { Point, SavedStrokeRow, Stroke } from './types';
+import type {
+  BoardDieFace,
+  BoardDiePlacement,
+  BoardDieVisual,
+  BoardTileDeckPlacement,
+  BoardTilePlacement,
+  BoardTileVisual,
+  BoardTokenPlacement,
+  BoardTokenSupply,
+  DeckCardDragSession,
+  DeckSpot,
+  DeckSpotDragSession,
+  DeckSpotType,
+  GameplayTakeDragSession,
+  GameplayTakePreview,
+  ImageTransformSession,
+  LoadedSurfaceArtwork,
+  PlacedImage,
+  PlacedSymbolHitTarget,
+  StrokeBounds,
+  SymbolTransformSession,
+  TilePlacementDragSession,
+  TilePlacementPreview,
+  TileSnapDragSession,
+  TileSnapGrid,
+  TileSnapPoint,
+  TokenMarkerDragSession,
+  TokenSupplyPlacement,
+} from './drawingCanvasTypes';
+export type {
+  BoardDieFace,
+  BoardDieVisual,
+  BoardTileDeckPlacement,
+  BoardTileVisual,
+  BoardTokenSupply,
+} from './drawingCanvasTypes';
+import {
+  GAMEPLAY_SNAP_GRID_CELL_SIZE,
+  SYMBOL_CANVAS_SIZE,
+  buildPlacedSymbolHitTargets,
+  findBoardTileAtPoint,
+  findDeckSpotAtPoint,
+  findNearestTileSnapPoint,
+  findNearestTileSnapPointInGrid,
+  findPlacedImageAtPoint,
+  findPlacedSymbolAtPoint,
+  getBoardTileSize,
+  getDeckSpotSize,
+  getDieFaceTile,
+  getStrokeBounds,
+  pointsToPath,
+  transformSymbolStrokes,
+} from './drawingCanvasGeometry';
+import {
+  invalidateSurfaceArtworkCache,
+} from './surfaceArtworkCache';
 import { styles } from './styles';
 import { drawingCanvasStyles } from './drawingCanvasStyles';
 import { withSafeWriteTransaction } from './databaseTransactions';
+import {
+  BoardTileArtworkPreview,
+  BoardTilePlacementView,
+  DeckSpotCardPreview,
+  DeckSpotMarkerView,
+} from './drawingCanvasPieces';
+export { BoardTileArtworkPreview } from './drawingCanvasPieces';
 
 // Reanimated exposes this flag inside worklets so callbacks can keep their
 // normal synchronous path on JavaScript and schedule only UI-thread calls.
 declare const global: typeof globalThis & { _WORKLET?: boolean };
-
-const SYMBOL_CANVAS_SIZE = 300;
-const DECK_SPOT_UNITS_PER_INCH = 24;
-const DECK_SPOT_MAX_EDGE = 120;
-const EMPTY_DECK_SPOT_SIZE_INCHES = 2.5;
-const BOARD_TILE_UNITS_PER_INCH = 24;
-const BOARD_TILE_MAX_EDGE = 240;
-const GAMEPLAY_SNAP_GRID_CELL_SIZE = 64;
-// pointsToPath converts a list of points into a Skia Path object.
-// This is important because the drawing canvas does not draw freehand lines directly from
-// an array of coordinates. Instead, it turns the points into a path that the Canvas can
-// render as a smooth stroke.
-function pointsToPath(points: Point[]) {
-  const path = Skia.PathBuilder.Make();
-
-  if (points.length > 0) {
-    // Start the path at the first point, then connect every next point with a line.
-    path.moveTo(points[0].x, points[0].y);
-
-    for (const point of points.slice(1)) {
-      path.lineTo(point.x, point.y);
-    }
-  }
-
-  return path.build();
-}
-
-type StrokeBounds = {
-  left: number;
-  top: number;
-  right: number;
-  bottom: number;
-};
-
-type SymbolTransformSession = {
-  groupId: string;
-  baseStrokes: Stroke[];
-  updatedStrokes: Stroke[];
-  center: Point;
-  startPoint: Point;
-  /** Set when a corner handle starts a drag, so that drag scales instead of moves. */
-  resizeStartDistance?: number;
-  changed: boolean;
-};
-
-type PlacedImage = {
-  id: number;
-  base64Data: string;
-  mimeType: string;
-  center: Point;
-  width: number;
-  height: number;
-};
-
-type LoadedSurfaceArtwork = {
-  backgroundColor: string | null;
-  backgroundImage: { base64Data: string; mimeType: string } | null;
-  strokes: Stroke[];
-  images: PlacedImage[];
-};
-
-type DecodedSkiaImage = NonNullable<ReturnType<typeof Skia.Image.MakeImageFromEncoded>>;
-type DecodedTileArtwork = {
-  backgroundImage: DecodedSkiaImage | null;
-  images: Array<PlacedImage & { decoded: DecodedSkiaImage | null }>;
-};
-
-// Copies of the same tile face share a single set of Skia paths and decoded
-// images. Weak keys let these assets be collected when their artwork unloads.
-const tileArtworkPathCache = new WeakMap<Stroke[], ReturnType<typeof pointsToPath>[]>();
-const tileArtworkImageCache = new WeakMap<PlacedImage[], DecodedTileArtwork>();
-
-// Several placed copies can use one saved token, tile, or card face. Share an
-// in-flight load so those previews do not all run the same three SQLite reads.
-const pendingSurfaceArtworkLoads = new Map<string, Promise<LoadedSurfaceArtwork>>();
-// Gameplay can show dozens of copies of one saved tile or card. Keep the
-// decoded database representation too, not only the in-flight promise, so each
-// newly placed copy does not repeat three SQLite reads and JSON parsing.
-const completedSurfaceArtworkLoads = new Map<string, { artwork: LoadedSurfaceArtwork; weight: number }>();
-// Flattened Skia snapshots turn a face's background, strokes, and images into
-// one reusable GPU image while keeping the editable source strokes in SQLite.
-const completedSurfaceRasters = new Map<string, { image: SkImage; weight: number }>();
-const pendingSurfaceRasterLoads = new Map<string, Promise<SkImage | null>>();
-const pendingSurfaceRasterCaptures = new Set<string>();
-const surfaceRasterListeners = new Map<string, Set<(image: SkImage) => void>>();
-const surfaceArtworkGenerations = new Map<string, number>();
-const MAX_CACHED_SURFACE_ARTWORK = 32;
-const MAX_CACHED_SURFACE_ARTWORK_CHARS = 12 * 1024 * 1024;
-const MAX_CACHED_SURFACE_RASTERS = 48;
-const MAX_CACHED_SURFACE_RASTER_BYTES = 24 * 1024 * 1024;
-let cachedSurfaceArtworkChars = 0;
-let cachedSurfaceRasterBytes = 0;
-
-function getCachedSurfaceRaster(key: string) {
-  const cached = completedSurfaceRasters.get(key);
-  if (!cached) return null;
-  completedSurfaceRasters.delete(key);
-  completedSurfaceRasters.set(key, cached);
-  return cached.image;
-}
-
-function subscribeToSurfaceRaster(key: string, listener: (image: SkImage) => void) {
-  const listeners = surfaceRasterListeners.get(key) ?? new Set<(image: SkImage) => void>();
-  listeners.add(listener);
-  surfaceRasterListeners.set(key, listeners);
-  return () => {
-    listeners.delete(listener);
-    if (listeners.size === 0) surfaceRasterListeners.delete(key);
-  };
-}
-
-function cacheSurfaceRaster(key: string, image: SkImage) {
-  const previous = completedSurfaceRasters.get(key);
-  if (previous) cachedSurfaceRasterBytes -= previous.weight;
-  const weight = image.width() * image.height() * 4;
-  completedSurfaceRasters.delete(key);
-  if (weight <= MAX_CACHED_SURFACE_RASTER_BYTES) {
-    completedSurfaceRasters.set(key, { image, weight });
-    cachedSurfaceRasterBytes += weight;
-  }
-  surfaceRasterListeners.get(key)?.forEach((listener) => listener(image));
-  while (completedSurfaceRasters.size > MAX_CACHED_SURFACE_RASTERS
-    || cachedSurfaceRasterBytes > MAX_CACHED_SURFACE_RASTER_BYTES) {
-    const oldestKey = completedSurfaceRasters.keys().next().value;
-    if (oldestKey === undefined) break;
-    const oldest = completedSurfaceRasters.get(oldestKey);
-    if (oldest) cachedSurfaceRasterBytes -= oldest.weight;
-    completedSurfaceRasters.delete(oldestKey);
-  }
-}
-
-function loadCachedSurfaceRaster(
-  db: SQLiteDatabase,
-  key: string,
-  surfaceId: string,
-  variant: string
-): Promise<SkImage | null> {
-  const cached = getCachedSurfaceRaster(key);
-  if (cached) return Promise.resolve(cached);
-  const pending = pendingSurfaceRasterLoads.get(key);
-  if (pending) return pending;
-  const load = db.getFirstAsync<{ png_data: Uint8Array }>(
-    'SELECT png_data FROM surface_artwork_rasters WHERE surface_id = ? AND variant = ?',
-    surfaceId,
-    variant
-  ).then((row) => {
-    if (!row?.png_data) return null;
-    try {
-      const image = Skia.Image.MakeImageFromEncoded(Skia.Data.fromBytes(row.png_data));
-      if (image) cacheSurfaceRaster(key, image);
-      return image;
-    } catch (error) {
-      console.warn('Could not decode cached surface artwork:', surfaceId, error);
-      return null;
-    }
-  }).catch((error) => {
-    console.warn('Could not load cached surface artwork:', surfaceId, error);
-    return null;
-  });
-  pendingSurfaceRasterLoads.set(key, load);
-  void load.finally(() => {
-    if (pendingSurfaceRasterLoads.get(key) === load) pendingSurfaceRasterLoads.delete(key);
-  }).catch(() => {});
-  return load;
-}
-
-function invalidateSurfaceArtworkCache(surfaceId: string) {
-  surfaceArtworkGenerations.set(surfaceId, (surfaceArtworkGenerations.get(surfaceId) ?? 0) + 1);
-  const cached = completedSurfaceArtworkLoads.get(surfaceId);
-  if (cached) {
-    cachedSurfaceArtworkChars -= cached.weight;
-    completedSurfaceArtworkLoads.delete(surfaceId);
-  }
-  for (const [key, cachedRaster] of completedSurfaceRasters) {
-    if (!key.startsWith(`${surfaceId}|`)) continue;
-    cachedSurfaceRasterBytes -= cachedRaster.weight;
-    completedSurfaceRasters.delete(key);
-  }
-}
-
-function loadSurfaceArtwork(db: SQLiteDatabase, surfaceId: string): Promise<LoadedSurfaceArtwork> {
-  const cachedArtwork = completedSurfaceArtworkLoads.get(surfaceId);
-  if (cachedArtwork) {
-    // Refresh insertion order to implement a small least-recently-used cache.
-    completedSurfaceArtworkLoads.delete(surfaceId);
-    completedSurfaceArtworkLoads.set(surfaceId, cachedArtwork);
-    return Promise.resolve(cachedArtwork.artwork);
-  }
-  const pendingLoad = pendingSurfaceArtworkLoads.get(surfaceId);
-  if (pendingLoad) return pendingLoad;
-
-  const generationAtStart = surfaceArtworkGenerations.get(surfaceId) ?? 0;
-  const load = Promise.all([
-    db.getFirstAsync<{
-      background_color: string | null;
-      background_image_data: string | null;
-      background_image_mime_type: string | null;
-    }>(
-      'SELECT background_color, background_image_data, background_image_mime_type FROM drawing_surfaces WHERE id = ?',
-      surfaceId
-    ).catch((error) => {
-      console.error('Could not load drawing-surface background:', surfaceId, error);
-      return null;
-    }),
-    db.getAllAsync<{
-      points_json: string; width: number; color: string; is_eraser: number; group_id: string | null;
-    }>(
-      'SELECT points_json, width, color, is_eraser, group_id FROM strokes WHERE surface_id = ? ORDER BY order_index',
-      surfaceId
-    ).catch((error) => {
-      console.error('Could not load drawing strokes:', surfaceId, error);
-      return [];
-    }),
-    db.getAllAsync<{
-      id: number; base64_data: string; mime_type: string;
-      center_x: number; center_y: number; width: number; height: number;
-    }>(
-      'SELECT id, base64_data, mime_type, center_x, center_y, width, height FROM surface_images WHERE surface_id = ? ORDER BY order_index',
-      surfaceId
-    ).catch((error) => {
-      console.error('Could not load drawing images:', surfaceId, error);
-      return [];
-    }),
-  ]).then(([surface, strokeRows, imageRows]): LoadedSurfaceArtwork => ({
-    backgroundColor: surface?.background_color ?? null,
-    backgroundImage: surface?.background_image_data && surface.background_image_mime_type
-      ? { base64Data: surface.background_image_data, mimeType: surface.background_image_mime_type }
-      : null,
-    strokes: strokeRows.flatMap((stroke) => {
-      try {
-        return [{
-          points: JSON.parse(stroke.points_json) as Point[],
-          width: stroke.width,
-          color: stroke.color,
-          eraser: stroke.is_eraser === 1,
-          groupId: stroke.group_id ?? undefined,
-        }];
-      } catch (error) {
-        console.error('Could not decode a saved drawing stroke:', surfaceId, error);
-        return [];
-      }
-    }),
-    images: imageRows.map((image) => ({
-      id: image.id,
-      base64Data: image.base64_data,
-      mimeType: image.mime_type,
-      center: { x: image.center_x, y: image.center_y },
-      width: image.width,
-      height: image.height,
-    })),
-  })).then((artwork) => {
-    // Do not put an old in-flight read back into the cache if an editor changed
-    // this surface while that read was pending.
-    if ((surfaceArtworkGenerations.get(surfaceId) ?? 0) === generationAtStart) {
-      const weight = (artwork.backgroundImage?.base64Data.length ?? 0)
-        + artwork.images.reduce((total, image) => total + image.base64Data.length, 0)
-        + artwork.strokes.reduce((total, stroke) => total + stroke.points.length * 32 + 96, 0);
-      if (weight <= MAX_CACHED_SURFACE_ARTWORK_CHARS) {
-        completedSurfaceArtworkLoads.set(surfaceId, { artwork, weight });
-        cachedSurfaceArtworkChars += weight;
-      }
-      while (completedSurfaceArtworkLoads.size > MAX_CACHED_SURFACE_ARTWORK
-        || cachedSurfaceArtworkChars > MAX_CACHED_SURFACE_ARTWORK_CHARS) {
-        const oldestSurfaceId = completedSurfaceArtworkLoads.keys().next().value;
-        if (oldestSurfaceId === undefined) break;
-        const oldest = completedSurfaceArtworkLoads.get(oldestSurfaceId);
-        if (oldest) cachedSurfaceArtworkChars -= oldest.weight;
-        completedSurfaceArtworkLoads.delete(oldestSurfaceId);
-      }
-    }
-    return artwork;
-  });
-
-  pendingSurfaceArtworkLoads.set(surfaceId, load);
-  void load.finally(() => {
-    if (pendingSurfaceArtworkLoads.get(surfaceId) === load) {
-      pendingSurfaceArtworkLoads.delete(surfaceId);
-    }
-  }).catch(() => {
-    // The caller reports the read error. This catch only prevents an unhandled
-    // rejection from the cleanup promise returned by finally().
-  });
-  return load;
-}
-
-type DeckSpotType = 'deck' | 'discard';
-
-type DeckSpot = {
-  id: number;
-  x: number;
-  y: number;
-  orientation: number;
-  spotType: DeckSpotType;
-  deckId: number | null;
-  faceUp: boolean;
-  cardCount: number;
-  topCard: {
-    name: string;
-    frontSurfaceId: string;
-    backSurfaceId: string | null;
-    widthInches: number;
-    heightInches: number;
-  } | null;
-};
-
-type DeckSpotDragSession = {
-  spotId: number;
-  baseSpot: DeckSpot;
-  updatedSpot: DeckSpot;
-  startPoint: Point;
-  changed: boolean;
-};
-
-type TileSnapPoint = { id: number; x: number; y: number; orientation: number };
-type TileSnapGrid = {
-  cellSize: number;
-  buckets: Record<string, TileSnapPoint[]>;
-};
-type TileSnapDragSession = {
-  pointId: number;
-  basePoint: TileSnapPoint;
-  updatedPoint: TileSnapPoint;
-  startPoint: Point;
-  changed: boolean;
-};
-
-export type BoardTileVisual = {
-  id: number;
-  name: string;
-  shape: 'hexagon' | 'square' | 'triangle' | 'circle';
-  widthInches: number;
-  heightInches: number;
-  color: string;
-  frontSurfaceId: string;
-  backSurfaceId: string | null;
-};
-
-export type BoardDieFace = { sideNumber: number; surfaceId: string };
-
-export type BoardDieVisual = {
-  id: number;
-  name: string;
-  sideCount: number;
-  widthInches: number;
-  heightInches: number;
-  color: string;
-  faces: BoardDieFace[];
-};
-
-export type BoardTileDeckPlacement = {
-  id: number;
-  name: string;
-  tileCount: number;
-  topTile: BoardTileVisual | null;
-};
-
-export type BoardTokenSupply = {
-  token: BoardTileVisual;
-  /** null means this supply never runs out. */
-  quantity: number | null;
-};
-
-type BoardTokenPlacement = {
-  id: number;
-  x: number;
-  y: number;
-  orientation: number;
-  faceUp: boolean;
-  token: BoardTileVisual;
-};
-
-type BoardDiePlacement = {
-  id: number;
-  x: number;
-  y: number;
-  orientation: number;
-  faceNumber: number;
-  die: BoardDieVisual;
-};
-
-type TokenMarkerDragSession = {
-  kind: 'supply' | 'token' | 'die';
-  id: number;
-  startPoint: Point;
-  startX: number;
-  startY: number;
-  updatedX: number;
-  updatedY: number;
-  changed: boolean;
-};
-
-type GameplayTakeDragSession = {
-  kind: 'token' | 'tile';
-  sourceId: number;
-  startPoint: Point;
-  updatedPoint: Point;
-  changed: boolean;
-};
-
-type DeckCardDragSession = {
-  sourceSpotId: number;
-  startPoint: Point;
-  updatedPoint: Point;
-  screenY: number;
-  changed: boolean;
-};
-
-type GameplayTakePreview = {
-  kind: 'token' | 'tile';
-  sourceId: number;
-  tile: BoardTileVisual;
-  startPoint: Point;
-};
-
-type BoardTilePlacement = {
-  id: number;
-  x: number;
-  y: number;
-  orientation: number;
-  faceUp: boolean;
-  tileId: number | null;
-  deckId: number | null;
-  deckName: string | null;
-  tileCount: number;
-  tile: BoardTileVisual | null;
-};
-
-type TokenSupplyPlacement = {
-  id: number;
-  x: number;
-  y: number;
-  orientation: number;
-  quantity: number | null;
-  token: BoardTileVisual;
-};
-
-type TilePlacementDragSession = {
-  placementId: number;
-  basePlacement: BoardTilePlacement;
-  updatedPlacement: BoardTilePlacement;
-  startPoint: Point;
-  changed: boolean;
-};
-
-type TilePlacementPreview = {
-  tile: BoardTileVisual | null;
-  deckId: number | null;
-  deckName: string | null;
-  tileCount: number;
-  faceUp: boolean;
-  x: number;
-  y: number;
-  orientation: number;
-  snapped: boolean;
-};
-
-type ImageTransformSession = {
-  imageId: number;
-  baseImage: PlacedImage;
-  updatedImage: PlacedImage;
-  center: Point;
-  startPoint: Point;
-  resizeStartDistance?: number;
-  changed: boolean;
-};
-
-function getStrokeBounds(strokes: Stroke[]): StrokeBounds | null {
-  let bounds: StrokeBounds | null = null;
-  for (const stroke of strokes) {
-    for (const point of stroke.points) {
-      if (!bounds) {
-        bounds = { left: point.x, top: point.y, right: point.x, bottom: point.y };
-        continue;
-      }
-      bounds.left = Math.min(bounds.left, point.x);
-      bounds.top = Math.min(bounds.top, point.y);
-      bounds.right = Math.max(bounds.right, point.x);
-      bounds.bottom = Math.max(bounds.bottom, point.y);
-    }
-  }
-  return bounds;
-}
-
-type PlacedSymbolHitTarget = { groupId: string; strokes: Stroke[]; bounds: StrokeBounds };
-
-function buildPlacedSymbolHitTargets(strokes: Stroke[]): PlacedSymbolHitTarget[] {
-  const groups = new Map<string, Stroke[]>();
-  for (const stroke of strokes) {
-    if (!stroke.groupId) continue;
-    const groupStrokes = groups.get(stroke.groupId);
-    if (groupStrokes) groupStrokes.push(stroke);
-    else groups.set(stroke.groupId, [stroke]);
-  }
-  return [...groups.entries()].reverse().flatMap(([groupId, groupStrokes]) => {
-    const bounds = getStrokeBounds(groupStrokes);
-    return bounds ? [{ groupId, strokes: groupStrokes, bounds }] : [];
-  });
-}
-
-function findPlacedSymbolAtPoint(
-  hitTargets: PlacedSymbolHitTarget[],
-  point: Point,
-  tolerance: number
-): PlacedSymbolHitTarget | null {
-  // Targets are prebuilt in topmost-first order. This check only compares a
-  // point against cached rectangles, instead of rescanning every stroke group.
-  for (const target of hitTargets) {
-    const { bounds } = target;
-    if (
-      point.x >= bounds.left - tolerance &&
-      point.x <= bounds.right + tolerance &&
-      point.y >= bounds.top - tolerance &&
-      point.y <= bounds.bottom + tolerance
-    ) {
-      return target;
-    }
-  }
-
-  return null;
-}
-
-function transformSymbolStrokes(
-  strokes: Stroke[],
-  center: Point,
-  scale: number,
-  offset: Point = { x: 0, y: 0 },
-  minimumWidth = 1
-): Stroke[] {
-  return strokes.map((stroke) => ({
-    ...stroke,
-    points: stroke.points.map((point) => ({
-      x: center.x + (point.x - center.x) * scale + offset.x,
-      y: center.y + (point.y - center.y) * scale + offset.y,
-    })),
-    width: Math.max(minimumWidth, stroke.width * scale),
-  }));
-}
-
-function findPlacedImageAtPoint(
-  images: PlacedImage[],
-  point: Point,
-  tolerance: number
-): PlacedImage | null {
-  // Later images are drawn above earlier ones, so search backwards to pick the
-  // image the user sees when two images overlap.
-  for (let index = images.length - 1; index >= 0; index -= 1) {
-    const image = images[index];
-    if (
-      point.x >= image.center.x - image.width / 2 - tolerance &&
-      point.x <= image.center.x + image.width / 2 + tolerance &&
-      point.y >= image.center.y - image.height / 2 - tolerance &&
-      point.y <= image.center.y + image.height / 2 + tolerance
-    ) {
-      return image;
-    }
-  }
-  return null;
-}
-
-function findDeckSpotAtPoint(
-  spots: DeckSpot[],
-  point: Point,
-  tolerance: number
-): DeckSpot | null {
-  for (let index = spots.length - 1; index >= 0; index -= 1) {
-    const spot = spots[index];
-    const size = getDeckSpotSize(spot);
-    const hitRadius = Math.hypot(size.width / 2, size.height / 2) + tolerance;
-    if (Math.hypot(point.x - spot.x, point.y - spot.y) <= hitRadius) {
-      return spot;
-    }
-  }
-  return null;
-}
-
-// Use stored inch dimensions to size each marker. A shared pixel scale makes
-// ordinary cards feel consistent; the cap keeps oversized custom cards usable.
-function getDeckSpotSize(spot: DeckSpot) {
-  const cardWidth = spot.topCard?.widthInches ?? EMPTY_DECK_SPOT_SIZE_INCHES;
-  const cardHeight = spot.topCard?.heightInches ?? EMPTY_DECK_SPOT_SIZE_INCHES;
-  const scale = Math.min(
-    DECK_SPOT_UNITS_PER_INCH,
-    DECK_SPOT_MAX_EDGE / Math.max(cardWidth, cardHeight)
-  );
-  return {
-    width: cardWidth * scale,
-    height: cardHeight * scale,
-  };
-}
-
-function getBoardTileSize(tile: BoardTileVisual | null) {
-  const widthInches = tile?.widthInches ?? EMPTY_DECK_SPOT_SIZE_INCHES;
-  // A regular flat-top hexagon is 2 / sqrt(3) times wider than it is tall.
-  // Keep the stored width and derive its height so all six sides match.
-  const heightInches = tile?.shape === 'hexagon'
-    ? widthInches * Math.sqrt(3) / 2
-    : tile?.heightInches ?? EMPTY_DECK_SPOT_SIZE_INCHES;
-  const scale = Math.min(
-    BOARD_TILE_UNITS_PER_INCH,
-    BOARD_TILE_MAX_EDGE / Math.max(widthInches, heightInches)
-  );
-  return { width: widthInches * scale, height: heightInches * scale };
-}
-
-function getDieFaceTile(die: BoardDieVisual, faceNumber: number): BoardTileVisual {
-  const face = die.faces.find((item) => item.sideNumber === faceNumber) ?? die.faces[0];
-  return {
-    id: die.id,
-    name: `${die.name} · Side ${face?.sideNumber ?? 1}`,
-    shape: 'square',
-    widthInches: die.widthInches,
-    heightInches: die.heightInches,
-    color: die.color,
-    frontSurfaceId: face?.surfaceId ?? '',
-    backSurfaceId: null,
-  };
-}
-
-function findNearestTileSnapPoint(
-  snapPoints: TileSnapPoint[],
-  point: Point,
-  threshold: number
-) {
-  let nearest: TileSnapPoint | null = null;
-  // Comparing squared distances avoids a square root for every snap point on
-  // every drag update, which matters on boards with many snap points.
-  let nearestDistanceSquared = threshold * threshold;
-  for (const snapPoint of snapPoints) {
-    const deltaX = point.x - snapPoint.x;
-    const deltaY = point.y - snapPoint.y;
-    const distanceSquared = deltaX * deltaX + deltaY * deltaY;
-    if (distanceSquared <= nearestDistanceSquared) {
-      nearest = snapPoint;
-      nearestDistanceSquared = distanceSquared;
-    }
-  }
-  return nearest;
-}
-
-function findNearestTileSnapPointInGrid(
-  grid: TileSnapGrid,
-  point: Point,
-  threshold: number
-) {
-  let nearest: TileSnapPoint | null = null;
-  let nearestDistanceSquared = threshold * threshold;
-  const cellX = Math.floor(point.x / grid.cellSize);
-  const cellY = Math.floor(point.y / grid.cellSize);
-  const cellRadius = Math.ceil(threshold / grid.cellSize);
-  for (let offsetY = -cellRadius; offsetY <= cellRadius; offsetY += 1) {
-    for (let offsetX = -cellRadius; offsetX <= cellRadius; offsetX += 1) {
-      const points = grid.buckets[`${cellX + offsetX},${cellY + offsetY}`];
-      if (!points) continue;
-      for (const snapPoint of points) {
-        const deltaX = point.x - snapPoint.x;
-        const deltaY = point.y - snapPoint.y;
-        const distanceSquared = deltaX * deltaX + deltaY * deltaY;
-        if (distanceSquared <= nearestDistanceSquared) {
-          nearest = snapPoint;
-          nearestDistanceSquared = distanceSquared;
-        }
-      }
-    }
-  }
-  return nearest;
-}
-
-function findBoardTileAtPoint<T extends { x: number; y: number; orientation: number; tile: BoardTileVisual | null }>(
-  placements: T[],
-  point: Point,
-  tolerance: number
-): T | null {
-  for (let index = placements.length - 1; index >= 0; index -= 1) {
-    const placement = placements[index];
-    const size = getBoardTileSize(placement.tile);
-    const angle = -placement.orientation * Math.PI / 180;
-    const dx = point.x - placement.x;
-    const dy = point.y - placement.y;
-    // Test in the tile's unrotated space, so the touch target follows the same
-    // outline the player sees instead of selecting through the empty corners.
-    const localPoint = {
-      x: dx * Math.cos(angle) - dy * Math.sin(angle) + size.width / 2,
-      y: dx * Math.sin(angle) + dy * Math.cos(angle) + size.height / 2,
-    };
-    if (placement.tile?.shape === 'circle') {
-      const rx = size.width / 2 + tolerance;
-      const ry = size.height / 2 + tolerance;
-      if ((localPoint.x - size.width / 2) ** 2 / (rx * rx)
-        + (localPoint.y - size.height / 2) ** 2 / (ry * ry) <= 1) return placement;
-      continue;
-    }
-
-    const vertices: Point[] = placement.tile?.shape === 'hexagon'
-      ? [
-          { x: size.width * 0.25, y: 0 }, { x: size.width * 0.75, y: 0 },
-          { x: size.width, y: size.height * 0.5 }, { x: size.width * 0.75, y: size.height },
-          { x: size.width * 0.25, y: size.height }, { x: 0, y: size.height * 0.5 },
-        ]
-      : placement.tile?.shape === 'triangle'
-        ? [
-            { x: size.width * 0.5, y: 0 }, { x: size.width, y: size.height },
-            { x: 0, y: size.height },
-          ]
-        : [
-            { x: 0, y: 0 }, { x: size.width, y: 0 },
-            { x: size.width, y: size.height }, { x: 0, y: size.height },
-          ];
-    const inside = vertices.every((start, vertexIndex) => {
-      const end = vertices[(vertexIndex + 1) % vertices.length];
-      const edgeX = end.x - start.x;
-      const edgeY = end.y - start.y;
-      const side = edgeX * (localPoint.y - start.y) - edgeY * (localPoint.x - start.x);
-      return side >= -tolerance * Math.hypot(edgeX, edgeY);
-    });
-    if (inside) return placement;
-  }
-  return null;
-}
 
 // DrawingCanvas is the shared freehand drawing surface for board, symbol, and card work.
 // It handles touch input, saves strokes, supports erasing, and provides canvas color,
@@ -888,6 +233,9 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     return { cellSize: GAMEPLAY_SNAP_GRID_CELL_SIZE, buckets };
   }, [tileSnapPoints]);
   const [boardTilePlacements, setBoardTilePlacements] = useState<BoardTilePlacement[]>([]);
+  // A completed animated drag gets a fresh native view identity so React
+  // Native cannot retain a stale transform on that one tile's wrapper.
+  const [tilePlacementRenderVersions, setTilePlacementRenderVersions] = useState<Record<number, number>>({});
   const [selectedBoardTilePlacementId, setSelectedBoardTilePlacementId] = useState<number | null>(null);
   // Hides the saved tile while its single live preview follows the finger.
   const [activeTileDragId, setActiveTileDragId] = useState<number | null>(null);
@@ -938,15 +286,22 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   // Gameplay drags use a UI-thread gesture for immediate visual tracking.
   // The normal JS gesture still owns hit testing and the final database save.
   const gameplayPieceDragKind = useSharedValue(0); // 1 = snapping tile, 2 = free-drag piece
-  const gameplayTileOriginalCenter = useSharedValue({ x: 0, y: 0 });
+  const gameplayTileDragState = useSharedValue({
+    active: false,
+    centerX: 0,
+    centerY: 0,
+    startBoardX: 0,
+    startBoardY: 0,
+    scale: 1,
+    transformX: 0,
+    transformY: 0,
+    rotation: 0,
+  });
   const gameplayDragHasMoved = useSharedValue(false);
   const gameplayDragPreviewRequested = useSharedValue(false);
   const gameplayDragStartLocal = useSharedValue({ x: 0, y: 0 });
   const gameplayLastTouchX = useSharedValue(0);
   const gameplayLastTouchY = useSharedValue(0);
-  const gameplayPieceBase = useSharedValue({ x: 0, y: 0, orientation: 0 });
-  const gameplayTileTransform = useSharedValue({ x: 0, y: 0, rotation: 0 });
-  const gameplayPieceScale = useSharedValue(1);
   const activePieceDragStyle = useAnimatedStyle(() => ({
     transform: [
       { translateX: activePieceOffsetX.value },
@@ -955,15 +310,19 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     ],
   }));
   // Keep tile movement in screen axes. Rotation belongs on the artwork inside
-  // the positioned wrapper, and one shared value updates both styles together.
-  const gameplayTilePositionStyle = useAnimatedStyle(() => ({
-    transform: [
-      { translateX: gameplayTileTransform.value.x },
-      { translateY: gameplayTileTransform.value.y },
-    ],
-  }));
+  // the positioned wrapper. One object keeps a fast follow-up drag from
+  // observing a mix of the previous tile's center, scale, and translation.
+  const gameplayTilePositionStyle = useAnimatedStyle(() => {
+    const drag = gameplayTileDragState.value;
+    return {
+      transform: [
+        { translateX: drag.transformX },
+        { translateY: drag.transformY },
+      ],
+    };
+  });
   const gameplayTileRotationStyle = useAnimatedStyle(() => ({
-    transform: [{ rotate: `${gameplayTileTransform.value.rotation}deg` }],
+    transform: [{ rotate: `${gameplayTileDragState.value.rotation}deg` }],
   }));
   const gameplayDragPreviewStyle = useAnimatedStyle(() => ({
     opacity: gameplayDragHasMoved.value ? 0.92 : 0,
@@ -2508,10 +1867,13 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     placeBoardTileAtPoint({ x: preview.x, y: preview.y }, tile, deck);
   }, [placeBoardTileAtPoint, placementTile, placementTileDeck]);
 
-  const queueBoardTilePlacementSave = useCallback((placement: BoardTilePlacement) => {
+  const queueBoardTilePlacementSave = useCallback((
+    placement: BoardTilePlacement,
+    saveAsGameplayState = gameplayMode
+  ) => {
     if (surfaceId === undefined) return;
     enqueueDatabaseAction(async () => {
-      if (gameplayMode) {
+      if (saveAsGameplayState) {
         await db.runAsync(
           `INSERT INTO gameplay_tile_placement_states
             (project_id, placement_id, x, y, orientation, face_up)
@@ -2539,14 +1901,14 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       tilePreviewRenderFrameRef.current = null;
     }
     pendingTilePreviewRef.current = null;
-    setActiveTileDragId(null);
     setTilePlacementPreview(null);
     if (session) {
+      const saveAsGameplayState = session.gameplayMode;
       let finalPlacement = session.updatedPlacement;
 
       // During gameplay use the final finger point captured by the gesture,
       // so the saved center matches the center shown beneath the finger.
-      if (gameplayMode && livePosition) {
+      if (saveAsGameplayState && livePosition) {
         finalPlacement = { ...session.basePlacement, ...livePosition };
         session.changed = Math.hypot(
           finalPlacement.x - session.basePlacement.x,
@@ -2557,7 +1919,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       }
 
       if (session.changed) {
-        if (gameplayMode && finalPlacement.tile) {
+        if (saveAsGameplayState && finalPlacement.tile) {
           const tileSize = getBoardTileSize(finalPlacement.tile);
           const snapPoint = findNearestTileSnapPointInGrid(
             gameplaySnapGrid,
@@ -2574,23 +1936,38 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           }
         }
         session.updatedPlacement = finalPlacement;
-        if (gameplayMode) pendingGameplayTileTransformResetRef.current = finalPlacement;
+        if (saveAsGameplayState) pendingGameplayTileTransformResetRef.current = finalPlacement;
         setBoardTilePlacements((current) => current.map((item) =>
           item.id === finalPlacement.id ? finalPlacement : item
         ));
-        queueBoardTilePlacementSave(finalPlacement);
+        queueBoardTilePlacementSave(finalPlacement, saveAsGameplayState);
       }
     }
     if (gameplayMode) {
       setActiveGameplayDragKey(null);
       if (!session?.changed) {
+        // No layout position is being committed for a tap. Clear the animated
+        // style before returning this tile to its normal render path.
+        setActiveTileDragId(null);
         activePieceOffsetX.value = 0;
         activePieceOffsetY.value = 0;
         activePieceRotation.value = 0;
-        gameplayTileTransform.value = { x: 0, y: 0, rotation: 0 };
+        gameplayTileDragState.value = {
+          active: false,
+          centerX: 0,
+          centerY: 0,
+          startBoardX: 0,
+          startBoardY: 0,
+          scale: 1,
+          transformX: 0,
+          transformY: 0,
+          rotation: 0,
+        };
       }
+    } else {
+      setActiveTileDragId(null);
     }
-  }, [activePieceOffsetX, activePieceOffsetY, activePieceRotation, gameplayMode, gameplaySnapGrid, gameplayTileTransform, queueBoardTilePlacementSave]);
+  }, [activePieceOffsetX, activePieceOffsetY, activePieceRotation, gameplayMode, gameplaySnapGrid, gameplayTileDragState, queueBoardTilePlacementSave]);
 
   const removeSelectedBoardTile = useCallback(() => {
     if (selectedBoardTilePlacementId === null) return;
@@ -3046,7 +2423,6 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   const canvasPinchOffsetX = useSharedValue(0);
   const canvasPinchOffsetY = useSharedValue(0);
   const canvasGestureScale = useSharedValue(1);
-  const canvasTransformGestureCountRef = useRef(0);
   const canvasTransformBaseRef = useRef({ offset: { x: 0, y: 0 }, zoom: 1 });
   const canvasPanActiveOnUI = useSharedValue(false);
   const canvasPinchActiveOnUI = useSharedValue(false);
@@ -3083,40 +2459,35 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   });
 
   const beginCanvasTransformGesture = useCallback(() => {
-    if (canvasTransformGestureCountRef.current === 0) {
-      pendingCanvasTransformResetRef.current = null;
-      setIsCanvasTransforming(true);
-      canvasTransformBaseRef.current = {
-        offset: boardOffsetRef.current,
-        zoom: zoomRef.current,
-      };
-      canvasBaseZoomOnUI.value = zoomRef.current;
-      canvasPanOffsetX.value = 0;
-      canvasPanOffsetY.value = 0;
-      canvasPinchOffsetX.value = 0;
-      canvasPinchOffsetY.value = 0;
-      canvasGestureScale.value = 1;
-    }
-    canvasTransformGestureCountRef.current += 1;
-  }, [canvasBaseZoomOnUI, canvasGestureScale, canvasPanOffsetX, canvasPanOffsetY, canvasPinchOffsetX, canvasPinchOffsetY]);
+    // The UI-thread gesture handler initializes temporary values before its
+    // first update. Keep this callback limited to capturing the saved base;
+    // resetting shared values here can erase movement that already happened.
+    pendingCanvasTransformResetRef.current = null;
+    setIsCanvasTransforming(true);
+    canvasTransformBaseRef.current = {
+      offset: boardOffsetRef.current,
+      zoom: zoomRef.current,
+    };
+  }, []);
 
-  const finishCanvasTransformGesture = useCallback(() => {
-    if (canvasTransformGestureCountRef.current === 0) return;
-    canvasTransformGestureCountRef.current -= 1;
-    if (canvasTransformGestureCountRef.current > 0) return;
-
+  const finishCanvasTransformGesture = useCallback((
+    scale: number,
+    panX: number,
+    panY: number,
+    pinchX: number,
+    pinchY: number,
+  ) => {
     const base = canvasTransformBaseRef.current;
-    const scale = canvasGestureScale.value;
     const nextZoom = base.zoom * scale;
     const nextOffset = {
-      x: base.offset.x * scale + canvasPanOffsetX.value + canvasPinchOffsetX.value,
-      y: base.offset.y * scale + canvasPanOffsetY.value + canvasPinchOffsetY.value,
+      x: base.offset.x * scale + panX + pinchX,
+      y: base.offset.y * scale + panY + pinchY,
     };
     pendingCanvasTransformResetRef.current = { offset: nextOffset, zoom: nextZoom };
     zoomRef.current = nextZoom;
     setZoom(nextZoom);
     updateBoardOffset(nextOffset.x, nextOffset.y);
-  }, [canvasGestureScale, canvasPanOffsetX, canvasPanOffsetY, canvasPinchOffsetX, canvasPinchOffsetY, updateBoardOffset]);
+  }, [updateBoardOffset]);
 
   // Reset the temporary matrix in the commit that contains the final layout
   // values, so the board never flashes back to its pre-gesture position.
@@ -3133,16 +2504,32 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     setIsCanvasTransforming(false);
   }, [boardOffset.x, boardOffset.y, canvasGestureScale, canvasPanOffsetX, canvasPanOffsetY, canvasPinchOffsetX, canvasPinchOffsetY, zoom]);
 
-  // A gameplay tile uses a shared-value transform while dragged. Clear that
-  // transform only after React has committed its new saved position.
+  // Keep the tile's animated style attached while React commits its new
+  // layout position. Clear the live offset first, then let the following
+  // render return the tile to its normal, non-animated style.
   useLayoutEffect(() => {
     const pending = pendingGameplayTileTransformResetRef.current;
-    if (!pending || activeTileDragId !== null) return;
+    if (!pending) return;
     const committed = boardTilePlacements.find((item) => item.id === pending.id);
     if (!committed || committed.x !== pending.x || committed.y !== pending.y) return;
     pendingGameplayTileTransformResetRef.current = null;
-    gameplayTileTransform.value = { x: 0, y: 0, rotation: 0 };
-  }, [activeTileDragId, boardTilePlacements, gameplayTileTransform]);
+    gameplayTileDragState.value = {
+      active: false,
+      centerX: 0,
+      centerY: 0,
+      startBoardX: 0,
+      startBoardY: 0,
+      scale: 1,
+      transformX: 0,
+      transformY: 0,
+      rotation: 0,
+    };
+    setTilePlacementRenderVersions((current) => ({
+      ...current,
+      [pending.id]: (current[pending.id] ?? 0) + 1,
+    }));
+    setActiveTileDragId(null);
+  }, [activeTileDragId, boardTilePlacements, gameplayTileDragState]);
 
   useLayoutEffect(() => {
     const pending = pendingGameplayTokenTransformResetRef.current;
@@ -3278,8 +2665,6 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         activePieceOffsetY.value = 0;
         activePieceRotation.value = token.orientation;
         gameplayPieceDragKind.value = 2;
-        gameplayPieceBase.value = { x: token.x, y: token.y, orientation: token.orientation };
-        gameplayPieceScale.value = zoomRef.current * coordinateScale;
         tokenMarkerDragSessionRef.current = {
           kind: 'token', id: token.id, startPoint: point,
           startX: token.x, startY: token.y, updatedX: token.x, updatedY: token.y, changed: false,
@@ -3310,8 +2695,6 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         activePieceOffsetY.value = 0;
         activePieceRotation.value = supplyHit.orientation;
         gameplayPieceDragKind.value = 2;
-        gameplayPieceBase.value = { x: point.x, y: point.y, orientation: supplyHit.orientation };
-        gameplayPieceScale.value = zoomRef.current * coordinateScale;
         return;
       }
       const tileDeckHit = findBoardTileAtPoint(
@@ -3340,8 +2723,6 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         activePieceOffsetY.value = 0;
         activePieceRotation.value = tileDeckHit.orientation;
         gameplayPieceDragKind.value = 2;
-        gameplayPieceBase.value = { x: point.x, y: point.y, orientation: tileDeckHit.orientation };
-        gameplayPieceScale.value = zoomRef.current * coordinateScale;
         return;
       }
       // Play mode still supports direct manipulation of game pieces. Start
@@ -3370,31 +2751,26 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         activePieceOffsetY.value = 0;
         activePieceRotation.value = tileHit.orientation;
         const tileScreenScale = zoomRef.current * coordinateScale;
-        gameplayTileOriginalCenter.value = { x: tileHit.x, y: tileHit.y };
-        // Some touch samples can arrive on the UI thread before JS finishes
-        // hit testing. Catch up to the latest sample now so the tile starts
-        // beneath the finger instead of appearing to lag behind it.
-        const startTouch = gameplayDragStartLocal.value;
-        const initialDelta = {
-          x: gameplayLastTouchX.value - startTouch.x,
-          y: gameplayLastTouchY.value - startTouch.y,
-        };
-        const touchMoved = Math.hypot(initialDelta.x, initialDelta.y) > 1;
-        gameplayDragHasMoved.value = touchMoved;
-        gameplayTileTransform.value = {
-          x: (point.x - tileHit.x) * tileScreenScale + initialDelta.x,
-          y: (point.y - tileHit.y) * tileScreenScale + initialDelta.y,
+        pendingGameplayTileTransformResetRef.current = null;
+        // Pan translation is cumulative from the original touch and stays in
+        // the same gesture coordinate space on every move. Keeping this
+        // original board point as the baseline avoids screen-origin drift.
+        gameplayDragHasMoved.value = false;
+        gameplayTileDragState.value = {
+          active: true,
+          centerX: tileHit.x,
+          centerY: tileHit.y,
+          startBoardX: point.x,
+          startBoardY: point.y,
+          scale: tileScreenScale,
+          transformX: (point.x - tileHit.x) * tileScreenScale,
+          transformY: (point.y - tileHit.y) * tileScreenScale,
           rotation: tileHit.orientation,
         };
         gameplayPieceDragKind.value = 1;
-        gameplayPieceBase.value = {
-          x: point.x,
-          y: point.y,
-          orientation: tileHit.orientation,
-        };
-        gameplayPieceScale.value = tileScreenScale;
         tilePlacementDragSessionRef.current = {
           placementId: tileHit.id,
+          gameplayMode,
           basePlacement: tileHit,
           updatedPlacement: tileHit,
           startPoint: point,
@@ -3434,8 +2810,6 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         activePieceOffsetY.value = 0;
         activePieceRotation.value = spot.orientation;
         gameplayPieceDragKind.value = 2;
-        gameplayPieceBase.value = { x: point.x, y: point.y, orientation: spot.orientation };
-        gameplayPieceScale.value = zoomRef.current * coordinateScale;
         return;
       }
       setSelectedBoardTokenId(null);
@@ -3628,6 +3002,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         tileSnapDragSessionRef.current = null;
         tilePlacementDragSessionRef.current = {
           placementId: selectedBoardTile.id,
+          gameplayMode,
           basePlacement: selectedBoardTile,
           updatedPlacement: selectedBoardTile,
           startPoint: point,
@@ -4157,7 +3532,6 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   };
 
   const handleDrawFinalize = (
-    liveTilePosition?: { x: number; y: number; orientation: number } | null,
     finalTouch?: { x: number; y: number } | null
   ) => {
     // Gameplay drags no longer send every pointer event to JavaScript. Update
@@ -4195,18 +3569,22 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       }
       const tileSession = tilePlacementDragSessionRef.current;
       if (tileSession) {
-        // Only count movement after the finger actually leaves its starting
-        // point; a stationary tap must not relocate a tile to the touch spot.
+        const releasedTilePosition = {
+          x: finalPoint.x,
+          y: finalPoint.y,
+          orientation: tileSession.updatedPlacement.orientation,
+        };
+        // Use the same board-space conversion as hit testing and tile
+        // placement. Reconstructing this from gesture translation can diverge
+        // from the canvas-local touch point after pan or zoom changes.
         tileSession.changed = Math.hypot(
-          finalPoint.x - tileSession.startPoint.x,
-          finalPoint.y - tileSession.startPoint.y
-        ) > 8 / (zoomRef.current * coordinateScale);
+          releasedTilePosition.x - tileSession.basePlacement.x,
+          releasedTilePosition.y - tileSession.basePlacement.y
+        ) > 1.5 / (zoomRef.current * coordinateScale);
         if (tileSession.changed) {
           tileSession.updatedPlacement = {
             ...tileSession.basePlacement,
-            x: liveTilePosition?.x ?? finalPoint.x,
-            y: liveTilePosition?.y ?? finalPoint.y,
-            orientation: liveTilePosition?.orientation ?? tileSession.basePlacement.orientation,
+            ...releasedTilePosition,
           };
         }
       }
@@ -4271,8 +3649,8 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     } else {
       finishStroke();
     }
-    // Keep the live gesture data available until tile release has copied
-    // its final UI-thread position into the saved placement.
+    // Keep the live transform active until release has committed the final
+    // touch coordinate into the saved placement.
     gameplayTileDragActiveRef.current = false;
     drawGestureRunOnJS.value = !gameplayMode;
   };
@@ -4291,6 +3669,17 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         // Start each touch with a clean drag kind. This prevents a quick
         // second move from inheriting the previous piece's live transform.
         gameplayPieceDragKind.value = 0;
+        gameplayTileDragState.value = {
+          active: false,
+          centerX: 0,
+          centerY: 0,
+          startBoardX: 0,
+          startBoardY: 0,
+          scale: 1,
+          transformX: 0,
+          transformY: 0,
+          rotation: 0,
+        };
         gameplayDragHasMoved.value = false;
         gameplayDragPreviewRequested.value = false;
         activePieceOffsetX.value = 0;
@@ -4307,17 +3696,18 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         gameplayLastTouchX.value = event.x;
         gameplayLastTouchY.value = event.y;
 
-        if (gameplayPieceDragKind.value === 1) {
-          const scale = gameplayPieceScale.value;
-          // Both hit testing and object layout use this drawing surface's
-          // local coordinate space, so use its local touch delta here too.
-          const dragX = event.x - gameplayDragStartLocal.value.x;
-          const dragY = event.y - gameplayDragStartLocal.value.y;
+        const tileDrag = gameplayTileDragState.value;
+        if (tileDrag.active) {
+          // Keep the tile's center, start point, scale, and current transform
+          // together in one shared value so rapid repeated drags cannot mix
+          // fields from different interactions.
           gameplayDragHasMoved.value = true;
-          gameplayTileTransform.value = {
-            x: (gameplayPieceBase.value.x - gameplayTileOriginalCenter.value.x) * scale + dragX,
-            y: (gameplayPieceBase.value.y - gameplayTileOriginalCenter.value.y) * scale + dragY,
-            rotation: gameplayPieceBase.value.orientation,
+          gameplayTileDragState.value = {
+            ...tileDrag,
+            transformX: (tileDrag.startBoardX - tileDrag.centerX) * tileDrag.scale
+              + event.translationX,
+            transformY: (tileDrag.startBoardY - tileDrag.centerY) * tileDrag.scale
+              + event.translationY,
           };
         } else if (gameplayPieceDragKind.value === 2) {
           // The active object follows the finger natively. JS only needs the
@@ -4341,26 +3731,14 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     onFinalize: () => {
       'worklet';
       if (global._WORKLET) {
-        let liveTilePosition: { x: number; y: number; orientation: number } | null = null;
-        if (gameplayPieceDragKind.value === 1 && gameplayDragHasMoved.value) {
-          const scale = Math.max(0.001, gameplayPieceScale.value);
-          const transform = gameplayTileTransform.value;
-          // Save the exact position represented by the live animated tile.
-          // Its wrapper is laid out at the saved center, and this translation
-          // puts that center under the finger throughout the drag.
-          liveTilePosition = {
-            x: gameplayTileOriginalCenter.value.x + transform.x / scale,
-            y: gameplayTileOriginalCenter.value.y + transform.y / scale,
-            orientation: transform.rotation,
-          };
-        }
         const finalTouch = gameplayMode
           ? { x: gameplayLastTouchX.value, y: gameplayLastTouchY.value }
           : null;
         // The final point is captured above, so a following drag can safely
         // begin with an empty kind even if JavaScript is still saving this one.
+        gameplayTileDragState.value = { ...gameplayTileDragState.value, active: false };
         gameplayPieceDragKind.value = 0;
-        scheduleOnRN(handleDrawFinalize, liveTilePosition, finalTouch);
+        scheduleOnRN(handleDrawFinalize, finalTouch);
       } else {
         handleDrawFinalize();
       }
@@ -4376,8 +3754,18 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     onActivate: () => {
       'worklet';
       if (isEditingSymbols) return;
+      // Initialize synchronously on the UI thread. Scheduling this reset via
+      // JavaScript allowed the user's first pan updates to be wiped out.
+      const startsNewTransform = !canvasPanActiveOnUI.value && !canvasPinchActiveOnUI.value;
+      if (startsNewTransform) {
+        canvasPanOffsetX.value = 0;
+        canvasPanOffsetY.value = 0;
+        canvasPinchOffsetX.value = 0;
+        canvasPinchOffsetY.value = 0;
+        canvasGestureScale.value = 1;
+      }
       canvasPanActiveOnUI.value = true;
-      scheduleOnRN(beginCanvasTransformGesture);
+      if (startsNewTransform) scheduleOnRN(beginCanvasTransformGesture);
     },
 
     onUpdate: (event) => {
@@ -4391,7 +3779,16 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       'worklet';
       if (!canvasPanActiveOnUI.value) return;
       canvasPanActiveOnUI.value = false;
-      scheduleOnRN(finishCanvasTransformGesture);
+      if (!canvasPinchActiveOnUI.value) {
+        scheduleOnRN(
+          finishCanvasTransformGesture,
+          canvasGestureScale.value,
+          canvasPanOffsetX.value,
+          canvasPanOffsetY.value,
+          canvasPinchOffsetX.value,
+          canvasPinchOffsetY.value,
+        );
+      }
     },
   });
 
@@ -4402,10 +3799,20 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     onActivate: (event) => {
       'worklet';
       if (isEditingSymbols) return;
+      // Keep an already-running two-finger pan when pinch joins it; otherwise
+      // start a clean temporary transform for this gesture.
+      const startsNewTransform = !canvasPanActiveOnUI.value && !canvasPinchActiveOnUI.value;
+      if (startsNewTransform) {
+        canvasPanOffsetX.value = 0;
+        canvasPanOffsetY.value = 0;
+        canvasPinchOffsetX.value = 0;
+        canvasPinchOffsetY.value = 0;
+        canvasGestureScale.value = 1;
+      }
       canvasPinchActiveOnUI.value = true;
       canvasPinchStartFocalX.value = event.focalX;
       canvasPinchStartFocalY.value = event.focalY;
-      scheduleOnRN(beginCanvasTransformGesture);
+      if (startsNewTransform) scheduleOnRN(beginCanvasTransformGesture);
     },
 
     onUpdate: (event) => {
@@ -4428,7 +3835,16 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       'worklet';
       if (!canvasPinchActiveOnUI.value) return;
       canvasPinchActiveOnUI.value = false;
-      scheduleOnRN(finishCanvasTransformGesture);
+      if (!canvasPanActiveOnUI.value) {
+        scheduleOnRN(
+          finishCanvasTransformGesture,
+          canvasGestureScale.value,
+          canvasPanOffsetX.value,
+          canvasPanOffsetY.value,
+          canvasPinchOffsetX.value,
+          canvasPinchOffsetY.value,
+        );
+      }
     },
   });
 
@@ -4767,7 +4183,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       <BoardTilePlacementView
         key={ghost
           ? placement.id !== undefined ? `tile-placement-drag-${placement.id}` : 'tile-placement-ghost'
-          : `board-tile-placement-${placement.id}`}
+          : `board-tile-placement-${placement.id}-${tilePlacementRenderVersions[placement.id ?? -1] ?? 0}`}
         placement={placement}
         transformScale={zoom * coordinateScale}
         offsetX={boardOffset.x}
@@ -5587,422 +5003,6 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           </View>
         </View>
       </Modal>
-    </View>
-  );
-});
-
-// Renders a saved tile face at its physical shape and aspect ratio on the board.
-type BoardTilePlacementVisual = (BoardTilePlacement | TilePlacementPreview) & { id?: number };
-
-const BoardTilePlacementView = memo(function BoardTilePlacementView({
-  placement,
-  transformScale,
-  offsetX,
-  offsetY,
-  selected,
-  ghost,
-  dragging,
-  animatedDrag,
-  snapped,
-  gameplayTilePositionStyle,
-  gameplayTileRotationStyle,
-}: {
-  placement: BoardTilePlacementVisual;
-  transformScale: number;
-  offsetX: number;
-  offsetY: number;
-  selected: boolean;
-  ghost: boolean;
-  dragging: boolean;
-  animatedDrag: boolean;
-  snapped: boolean;
-  gameplayTilePositionStyle: ReturnType<typeof useAnimatedStyle>;
-  gameplayTileRotationStyle: ReturnType<typeof useAnimatedStyle>;
-}) {
-  const tileSize = getBoardTileSize(placement.tile);
-  const width = placement.tile ? tileSize.width * transformScale : 92 * transformScale;
-  const height = placement.tile ? tileSize.height * transformScale : 56 * transformScale;
-  const left = placement.x * transformScale + offsetX - width / 2;
-  const top = placement.y * transformScale + offsetY - height / 2;
-
-  return (
-    <Animated.View
-      pointerEvents="none"
-      renderToHardwareTextureAndroid={animatedDrag}
-      shouldRasterizeIOS={animatedDrag}
-      style={[
-        drawingCanvasStyles.boardTilePlacement,
-        selected && drawingCanvasStyles.selectedBoardTilePlacement,
-        { left, top, width, height, opacity: ghost && !dragging ? 0.55 : 1 },
-        dragging && { zIndex: 50, elevation: 50 },
-        animatedDrag && gameplayTilePositionStyle,
-      ]}
-    >
-      <Animated.View style={[{
-        width, height, alignItems: 'center', justifyContent: 'center',
-      }, animatedDrag
-        ? gameplayTileRotationStyle
-        : { transform: [{ rotate: `${placement.orientation}deg` }] }]}>
-        {placement.deckId !== null && placement.tile
-          && (placement.tile.shape === 'square' || placement.tile.shape === 'circle') && (
-            <View style={[
-              drawingCanvasStyles.tileDeckStackLayer,
-              { width, height, borderRadius: placement.tile.shape === 'circle' ? Math.max(width, height) / 2 : 0 },
-            ]} />
-          )}
-        {placement.tile ? (
-          <BoardTileArtworkPreview
-            tile={placement.tile}
-            width={width}
-            height={height}
-            faceUp={placement.faceUp}
-            selected={selected}
-          />
-        ) : (
-          <View style={[drawingCanvasStyles.emptyTileDeck, selected && drawingCanvasStyles.selectedEmptyTileDeck]}>
-            <Text numberOfLines={1} style={drawingCanvasStyles.emptyTileDeckName}>{placement.deckName ?? 'Tile deck'}</Text>
-            <Text style={drawingCanvasStyles.emptyTileDeckCount}>{placement.tileCount} tiles</Text>
-          </View>
-        )}
-        {placement.deckId !== null && placement.tile && (
-          <View style={drawingCanvasStyles.tileDeckCountBadge}>
-            <Text style={drawingCanvasStyles.tileDeckCountText}>{placement.tileCount}</Text>
-          </View>
-        )}
-        {ghost && snapped && (
-          <View style={drawingCanvasStyles.snappedTileBadge}><Text style={drawingCanvasStyles.snappedTileBadgeText}>Snap</Text></View>
-        )}
-      </Animated.View>
-    </Animated.View>
-  );
-});
-
-export const BoardTileArtworkPreview = memo(function BoardTileArtworkPreview({
-  tile,
-  width,
-  height,
-  faceUp,
-  selected = false,
-  showOutline = true,
-  drawErasers = true,
-}: {
-  tile: BoardTileVisual;
-  width: number;
-  height: number;
-  faceUp: boolean;
-  selected?: boolean;
-  showOutline?: boolean;
-  drawErasers?: boolean;
-}) {
-  const db = useSQLiteContext();
-  const canvasRef = useCanvasRef();
-  const artworkSurfaceId = !faceUp && tile.backSurfaceId
-    ? tile.backSurfaceId
-    : tile.frontSurfaceId;
-  const rasterVariant = `${tile.shape}|${tile.widthInches}|${tile.heightInches}|${tile.color}|erasers:${Number(drawErasers)}`;
-  const rasterKey = `${artworkSurfaceId}|${rasterVariant}`;
-  const [artwork, setArtwork] = useState<{
-    backgroundColor: string;
-    backgroundImage: { base64Data: string; mimeType: string } | null;
-    strokes: Stroke[];
-    images: PlacedImage[];
-  } | null>(null);
-  const [flattenedArtwork, setFlattenedArtwork] = useState<SkImage | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setArtwork(null);
-    setFlattenedArtwork(null);
-    const loadArtwork = async () => {
-      try {
-        const loaded = await loadSurfaceArtwork(db, artworkSurfaceId);
-        if (!cancelled) setArtwork({ ...loaded, backgroundColor: loaded.backgroundColor ?? tile.color });
-      } catch (error) {
-        console.error('Could not load tile artwork for the board:', error);
-      }
-    };
-    void loadCachedSurfaceRaster(db, rasterKey, artworkSurfaceId, rasterVariant).then((cachedRaster) => {
-      if (cancelled) return;
-      if (cachedRaster) setFlattenedArtwork(cachedRaster);
-      else void loadArtwork();
-    });
-    return () => { cancelled = true; };
-  }, [artworkSurfaceId, db, rasterKey, rasterVariant, tile.color]);
-
-  useEffect(() => {
-    if (flattenedArtwork) return;
-    const cached = getCachedSurfaceRaster(rasterKey);
-    if (cached) {
-      setFlattenedArtwork(cached);
-      return;
-    }
-    return subscribeToSurfaceRaster(rasterKey, setFlattenedArtwork);
-  }, [flattenedArtwork, rasterKey]);
-
-  useEffect(() => {
-    if (!artwork || flattenedArtwork || pendingSurfaceRasterCaptures.has(rasterKey)) return;
-    pendingSurfaceRasterCaptures.add(rasterKey);
-    let cancelled = false;
-    let firstFrame = 0;
-    let secondFrame = 0;
-    const generationAtStart = surfaceArtworkGenerations.get(artworkSurfaceId) ?? 0;
-    // Let Skia paint the full face once, then retain a single image for every
-    // later placement and drag. The source strokes remain editable in SQLite.
-    firstFrame = requestAnimationFrame(() => {
-      secondFrame = requestAnimationFrame(() => {
-        void canvasRef.current?.makeImageSnapshotAsync().then((image) => {
-          if (cancelled || (surfaceArtworkGenerations.get(artworkSurfaceId) ?? 0) !== generationAtStart) return;
-          cacheSurfaceRaster(rasterKey, image);
-          const pngBytes = image.encodeToBytes(ImageFormat.PNG);
-          void db.runAsync(
-            `INSERT INTO surface_artwork_rasters
-              (surface_id, variant, png_data, pixel_width, pixel_height, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(surface_id, variant) DO UPDATE SET
-               png_data = excluded.png_data,
-               pixel_width = excluded.pixel_width,
-               pixel_height = excluded.pixel_height,
-               updated_at = excluded.updated_at`,
-            artworkSurfaceId,
-            rasterVariant,
-            pngBytes,
-            image.width(),
-            image.height(),
-            Date.now()
-          ).catch((error) => console.warn('Could not save cached surface artwork:', artworkSurfaceId, error));
-          setFlattenedArtwork(image);
-          setArtwork(null);
-        }).catch(() => {
-          // If the platform cannot snapshot this frame, keep drawing the live
-          // Skia scene. The next mount can retry without affecting editing.
-        }).finally(() => pendingSurfaceRasterCaptures.delete(rasterKey));
-      });
-    });
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(firstFrame);
-      cancelAnimationFrame(secondFrame);
-      pendingSurfaceRasterCaptures.delete(rasterKey);
-    };
-  }, [artwork, artworkSurfaceId, canvasRef, db, flattenedArtwork, rasterKey, rasterVariant]);
-
-  const pixelScale = width / tile.widthInches;
-  const tileShapePath = useMemo(() => {
-    const path = Skia.PathBuilder.Make();
-    if (tile.shape === 'circle') {
-      path.addOval({ x: 0, y: 0, width, height });
-    } else if (tile.shape === 'square') {
-      path.addRect({ x: 0, y: 0, width, height });
-    } else {
-      const points = tile.shape === 'hexagon'
-        ? [
-            { x: width * 0.25, y: 0 }, { x: width * 0.75, y: 0 }, { x: width, y: height * 0.5 },
-            { x: width * 0.75, y: height }, { x: width * 0.25, y: height }, { x: 0, y: height * 0.5 },
-          ]
-        : [{ x: width * 0.5, y: 0 }, { x: width, y: height }, { x: 0, y: height }];
-      points.forEach((point, index) => {
-        if (index === 0) path.moveTo(point.x, point.y);
-        else path.lineTo(point.x, point.y);
-      });
-      path.close();
-    }
-    return path.build();
-  }, [height, tile.shape, width]);
-
-  // Decode the saved image bytes for Skia once. Keeping tile artwork in Skia
-  // lets the polygon mask clip it transparently instead of painting the board
-  // color into the corners (which could cover an adjacent tile underneath).
-  const decodedArtwork = useMemo(() => {
-    if (!artwork || flattenedArtwork) return null;
-    const cached = tileArtworkImageCache.get(artwork.images);
-    if (cached) return cached;
-    const decode = (base64Data: string) => {
-      try {
-        return Skia.Image.MakeImageFromEncoded(Skia.Data.fromBase64(base64Data));
-      } catch (error) {
-        console.warn('Could not decode tile artwork image:', error);
-        return null;
-      }
-    };
-    const decoded: DecodedTileArtwork = {
-      backgroundImage: artwork.backgroundImage ? decode(artwork.backgroundImage.base64Data) : null,
-      images: artwork.images.map((image) => ({ ...image, decoded: decode(image.base64Data) })),
-    };
-    tileArtworkImageCache.set(artwork.images, decoded);
-    return decoded;
-  }, [artwork, flattenedArtwork]);
-  // Build saved paths once per artwork load instead of rebuilding all tile
-  // strokes whenever a neighboring piece or board control re-renders.
-  const artworkStrokePaths = useMemo(
-    () => {
-       if (!artwork || flattenedArtwork) return [];
-      const cached = tileArtworkPathCache.get(artwork.strokes);
-      if (cached) return cached;
-      const paths = artwork.strokes.map((stroke) => pointsToPath(stroke.points));
-      tileArtworkPathCache.set(artwork.strokes, paths);
-      return paths;
-    },
-    [artwork?.strokes, flattenedArtwork]
-  );
-
-  const outlineColor = selected ? '#315EFB' : '#4B5563';
-  return (
-    <View pointerEvents="none" style={{
-      width,
-      height,
-      backgroundColor: 'transparent',
-    }}>
-      <Canvas ref={canvasRef} style={StyleSheet.absoluteFill}>
-        {flattenedArtwork ? (
-          <SkiaImage image={flattenedArtwork} x={0} y={0} width={width} height={height} fit="fill" />
-        ) : (
-          <Mask mask={<Path path={tileShapePath} color="#FFFFFF" />} mode="alpha">
-            <Group>
-              <Rect x={0} y={0} width={width} height={height} color={artwork?.backgroundColor ?? tile.color} />
-              {decodedArtwork?.backgroundImage && (
-                <SkiaImage
-                  image={decodedArtwork.backgroundImage}
-                  x={0}
-                  y={0}
-                  width={width}
-                  height={height}
-                  fit="cover"
-                />
-              )}
-              <Group transform={[{ scale: pixelScale }]}>
-                {artwork?.strokes.map((stroke, index) => !drawErasers && stroke.eraser ? null : (
-                  <Path
-                    key={`board-tile-stroke-${tile.id}-${index}`}
-                    path={artworkStrokePaths[index]}
-                    color={stroke.color}
-                    style="stroke"
-                    strokeWidth={stroke.width}
-                    strokeCap="round"
-                    strokeJoin="round"
-                    blendMode={stroke.eraser ? 'clear' : 'srcOver'}
-                  />
-                ))}
-              </Group>
-              {decodedArtwork?.images.map((image) => image.decoded && (
-                <SkiaImage
-                  key={`board-tile-image-${image.id}`}
-                  image={image.decoded}
-                  x={(image.center.x - image.width / 2) * pixelScale}
-                  y={(image.center.y - image.height / 2) * pixelScale}
-                  width={image.width * pixelScale}
-                  height={image.height * pixelScale}
-                  fit="contain"
-                />
-              ))}
-            </Group>
-          </Mask>
-        )}
-      </Canvas>
-      {showOutline && (
-        <Canvas pointerEvents="none" style={StyleSheet.absoluteFill}>
-          <Path path={tileShapePath} color={outlineColor} style="stroke" strokeWidth={selected ? 2.5 : 1.5} />
-        </Canvas>
-      )}
-    </View>
-  );
-});
-
-// A small, non-interactive thumbnail lets a saved deck spot show the actual top
-// card. It reads the same strokes, images, and background that the card editor saves.
-const DeckSpotCardPreview = memo(function DeckSpotCardPreview({
-  surfaceId,
-  width,
-  height,
-  cardWidth,
-  cardHeight,
-}: {
-  surfaceId: string;
-  width: number;
-  height: number;
-  cardWidth: number;
-  cardHeight: number;
-}) {
-  const cardTile: BoardTileVisual = {
-    id: -1,
-    name: 'Card face',
-    shape: 'square',
-    widthInches: cardWidth,
-    heightInches: cardHeight,
-    color: '#FFFFFF',
-    frontSurfaceId: surfaceId,
-    backSurfaceId: null,
-  };
-  return (
-    <BoardTileArtworkPreview
-      tile={cardTile}
-      width={width}
-      height={height}
-      faceUp
-      showOutline={false}
-      drawErasers={false}
-    />
-  );
-});
-
-// Most pile markers are unchanged after a draw. Memoizing each marker means a
-// draw only rerenders its source/destination preview and count badge.
-const DeckSpotMarkerView = memo(function DeckSpotMarkerView({
-  spot,
-  transformScale,
-  offsetX,
-  offsetY,
-  selected,
-  gameplayMode,
-}: {
-  spot: DeckSpot;
-  transformScale: number;
-  offsetX: number;
-  offsetY: number;
-  selected: boolean;
-  gameplayMode: boolean;
-}) {
-  const cardSize = getDeckSpotSize(spot);
-  const markerWidth = cardSize.width * transformScale;
-  const markerHeight = cardSize.height * transformScale;
-  const left = spot.x * transformScale + offsetX - markerWidth / 2;
-  const top = spot.y * transformScale + offsetY - markerHeight / 2;
-  const previewSurfaceId = spot.topCard
-    ? spot.faceUp
-      ? spot.topCard.frontSurfaceId
-      : spot.topCard.backSurfaceId ?? spot.topCard.frontSurfaceId
-    : null;
-
-  return (
-    <View
-      pointerEvents="none"
-      style={[
-        drawingCanvasStyles.deckSpotMarker,
-        selected && drawingCanvasStyles.selectedDeckSpotMarker,
-        {
-          left,
-          top,
-          width: markerWidth,
-          height: markerHeight,
-          transform: [{ rotate: `${spot.orientation}deg` }],
-        },
-      ]}
-    >
-      {previewSurfaceId && spot.topCard ? (
-        <DeckSpotCardPreview
-          surfaceId={previewSurfaceId}
-          width={markerWidth - 4}
-          height={markerHeight - 4}
-          cardWidth={spot.topCard.widthInches}
-          cardHeight={spot.topCard.heightInches}
-        />
-      ) : (
-        <Text style={drawingCanvasStyles.emptyDeckSpotLabel}>Empty</Text>
-      )}
-      {gameplayMode && (
-        <View style={drawingCanvasStyles.tileDeckCountBadge}>
-          <Text style={drawingCanvasStyles.tileDeckCountText}>{spot.cardCount}</Text>
-        </View>
-      )}
     </View>
   );
 });

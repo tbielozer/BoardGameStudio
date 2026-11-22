@@ -1725,7 +1725,9 @@ function AppContent() {
             The rest of the UI sits on top of it. */}
         <DrawingCanvas
           ref={boardCanvasRef}
-          key={activeProjectId ?? 'no-project'}
+          // Keep the editor's base board in a separate canvas instance from
+          // gameplay's transient positions, piles, and in-memory placements.
+          key={`${activeProjectId ?? 'no-project'}-${isPlaying ? 'gameplay' : 'editor'}`}
           bottomInset={0}
           topInset={insets.top + 5}
           surfaceId={activeProjectId ? `${activeProjectId}-board` : undefined}
