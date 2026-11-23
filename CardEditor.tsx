@@ -12,6 +12,7 @@ import {
 import Slider from '@react-native-community/slider';
 import { useSQLiteContext } from 'expo-sqlite';
 import { DrawingCanvas, type DrawingCanvasHandle } from './DrawingCanvas';
+import { invalidateSurfaceArtworkCache } from './surfaceArtworkCache';
 import { cardEditorStyles as styles } from './cardEditorStyles';
 
 const DEFAULT_WIDTH_INCHES = 2.5;
@@ -736,6 +737,7 @@ export function CardEditor({
         );
       }
 
+      invalidateSurfaceArtworkCache(backSurfaceId);
       setCanvasRevision((revision) => revision + 1);
       setCardBackLibraryOpen(false);
     } catch (error) {
@@ -829,7 +831,11 @@ export function CardEditor({
           onPress: () => {
             void (async () => {
               try {
-                await db.runAsync('DELETE FROM card_decks WHERE id = ?', deck.id);
+                await db.withTransactionAsync(async () => {
+                  // Markers that used this deck become plain empty piles.
+                  await db.runAsync('UPDATE deck_spots SET deck_id = NULL WHERE deck_id = ?', deck.id);
+                  await db.runAsync('DELETE FROM card_decks WHERE id = ?', deck.id);
+                });
                 const remainingDecks = decks.filter((item) => item.id !== deck.id);
                 setDecks(remainingDecks);
                 if (activeDeckId === deck.id) {

@@ -11,6 +11,7 @@ import {
 import Slider from '@react-native-community/slider';
 import { useSQLiteContext } from 'expo-sqlite';
 import { DrawingCanvas, type DrawingCanvasHandle } from './DrawingCanvas';
+import { invalidateSurfaceArtworkCache } from './surfaceArtworkCache';
 import { tileEditorStyles as s } from './tileEditorStyles';
 
 type TileShape = 'hexagon' | 'square' | 'triangle' | 'circle';
@@ -255,6 +256,7 @@ export function TileEditor({ projectId, symbols, topInset, bottomInset, onClose 
         'UPDATE drawing_surfaces SET name = ?, background_color = ? WHERE id = ?',
         name, tileColor, activeTile.surface_id
       );
+      invalidateSurfaceArtworkCache(activeTile.surface_id);
       setSizeDialogOpen(false);
       await loadData();
     } catch (error) {
@@ -337,6 +339,7 @@ export function TileEditor({ projectId, symbols, topInset, bottomInset, onClose 
           image.center_y, image.width, image.height, image.order_index
         );
       }
+      invalidateSurfaceArtworkCache(backSurfaceId);
       setCanvasRevision((revision) => revision + 1);
       setSavedBackLibraryOpen(false);
     } catch (error) {
