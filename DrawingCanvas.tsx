@@ -142,9 +142,14 @@ type DrawingCanvasProps = {
   onStopEditingSymbols?: () => void;
   gameplayMode?: boolean;
   gameplayDrawFaceUp?: boolean;
-  onDeckCardDragRequest?: (sourceSpotId: number, targetSpotId: number | null, absoluteY: number) => void;
+  onDeckCardDragRequest?: (sourceSpotId: number, targetSpotId: number | null, absoluteY: number, dropPoint: Point) => void;
+  onDeckOrderRequested?: (kind: 'card' | 'tile', deckId: number) => void;
   handCardDropRequest?: { requestId: number; cardInstanceId: number; absoluteX: number; absoluteY: number };
-  onHandCardDropResolved?: (request: { requestId: number; cardInstanceId: number }, deckSpotId: number | null) => void;
+  onHandCardDropResolved?: (
+    request: { requestId: number; cardInstanceId: number },
+    deckSpotId: number | null,
+    dropPoint: Point | null
+  ) => void;
 };
 
 export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>(function DrawingCanvas({
@@ -189,6 +194,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     gameplayMode = false,
     gameplayDrawFaceUp = false,
     onDeckCardDragRequest,
+    onDeckOrderRequested,
     handCardDropRequest,
     onHandCardDropResolved,
   }: DrawingCanvasProps, ref) {
@@ -749,6 +755,17 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
                 WHERE taken.project_id = deck.project_id AND taken.deck_id = item.deck_id
                   AND taken.tile_id = item.tile_id), 0) > 0`
           : 'item.quantity > 0';
+        const fallbackTopTile = `(SELECT item.tile_id FROM tile_deck_items AS item
+            WHERE item.deck_id = placement.deck_id AND ${availableTopTile}
+            ORDER BY item.tile_id LIMIT 1)`;
+        const topTileSelection = gameplayMode
+          ? `COALESCE(
+              (SELECT ordered.tile_id FROM gameplay_tile_deck_order AS ordered
+               WHERE ordered.project_id = deck.project_id AND ordered.deck_id = placement.deck_id
+                 AND ordered.tile_id IS NOT NULL ORDER BY ordered.order_index, ordered.id LIMIT 1),
+              ${fallbackTopTile}
+            )`
+          : fallbackTopTile;
         const gameplayTileFilters = gameplayMode
           // A tile drawn from a deck is marked is_added in runtime state; it
           // is still a real piece in Play, so only returned tiles are hidden.
@@ -782,11 +799,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           ${tilePlacementStateJoin}
           LEFT JOIN game_tiles AS tile ON tile.id = placement.tile_id
           LEFT JOIN tile_decks AS deck ON deck.id = placement.deck_id
-          LEFT JOIN game_tiles AS top_tile ON top_tile.id = (
-            SELECT item.tile_id FROM tile_deck_items AS item
-            WHERE item.deck_id = placement.deck_id AND ${availableTopTile}
-            ORDER BY item.tile_id LIMIT 1
-          )
+          LEFT JOIN game_tiles AS top_tile ON top_tile.id = ${topTileSelection}
           WHERE placement.surface_id = ?
             ${gameplayTileFilters}
           ORDER BY placement.id`,
@@ -968,9 +981,36 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
               WHERE spot.surface_id = ?${spotFilter} ORDER BY spot.id ASC`,
           ...spotQueryParameters
         );
+        const gameplayPileRows = gameplayMode
+          ? await db.getAllAsync<{
+            id: number; x: number; y: number; orientation: number; card_count: number;
+            top_face_up: number | null; top_card_name: string | null; front_surface_id: string | null;
+            back_surface_id: string | null; width_inches: number | null; height_inches: number | null;
+          }>(
+            `SELECT pile.id, pile.x, pile.y, pile.orientation,
+              (SELECT COUNT(*) FROM play_card_instances AS instance
+               WHERE instance.project_id = pile.project_id AND instance.gameplay_pile_id = pile.id) AS card_count,
+              top_instance.face_up AS top_face_up, card.name AS top_card_name,
+              card.surface_id AS front_surface_id, card.back_surface_id,
+              card.width_inches, card.height_inches
+             FROM gameplay_card_piles AS pile
+             LEFT JOIN play_card_instances AS top_instance ON top_instance.id = (
+               SELECT instance.id FROM play_card_instances AS instance
+               WHERE instance.project_id = pile.project_id AND instance.gameplay_pile_id = pile.id
+               ORDER BY instance.gameplay_pile_order, instance.id LIMIT 1
+             )
+             LEFT JOIN cards AS card ON card.id = top_instance.card_id
+             WHERE pile.project_id = ? AND EXISTS (
+               SELECT 1 FROM play_card_instances AS instance
+               WHERE instance.project_id = pile.project_id AND instance.gameplay_pile_id = pile.id
+             )
+             ORDER BY pile.id`,
+            surfaceId.replace(/-board$/, '')
+          )
+          : [];
 
         if (!cancelled) {
-          const updatedSpots = rows.map((row) => ({
+          const updatedSpots: DeckSpot[] = rows.map((row) => ({
             id: row.id,
             x: row.x,
             y: row.y,
@@ -987,6 +1027,25 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
                   widthInches: row.width_inches,
                   heightInches: row.height_inches,
                 }
+              : null,
+          }));
+          const gameplayPiles: DeckSpot[] = gameplayPileRows.map((row) => ({
+            id: -row.id,
+            x: row.x,
+            y: row.y,
+            orientation: row.orientation,
+            spotType: 'discard',
+            deckId: null,
+            faceUp: row.top_face_up === 1,
+            cardCount: row.card_count,
+            topCard: row.top_card_name && row.front_surface_id && row.width_inches && row.height_inches
+              ? {
+                name: row.top_card_name,
+                frontSurfaceId: row.front_surface_id,
+                backSurfaceId: row.back_surface_id,
+                widthInches: row.width_inches,
+                heightInches: row.height_inches,
+              }
               : null,
           }));
           if (gameplayPileRefreshIds?.length) {
@@ -1015,7 +1074,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
               };
             }));
           } else {
-            setDeckSpots(updatedSpots);
+            setDeckSpots([...updatedSpots, ...gameplayPiles]);
             setSelectedDeckSpotId(null);
           }
         }
@@ -1564,8 +1623,26 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           back_surface_id: string | null; remaining_quantity: number;
         }>(availableTilesQuery, projectId, projectId, deckId);
         const availableTilesWithStock = availableTiles.filter((tile) => tile.remaining_quantity > 0);
-        const tileRow = availableTilesWithStock[0];
+        const orderedTopCopy = await txn.getFirstAsync<{ id: number; tile_id: number }>(
+          `SELECT id, tile_id FROM gameplay_tile_deck_order
+           WHERE project_id = ? AND deck_id = ? AND tile_id IS NOT NULL
+           ORDER BY order_index, id LIMIT 1`,
+          projectId,
+          deckId
+        );
+        const tileRow = (orderedTopCopy
+          ? availableTilesWithStock.find((tile) => tile.id === orderedTopCopy.tile_id)
+          : null) ?? availableTilesWithStock[0];
         if (!tileRow) throw new Error('This tile deck is empty.');
+        if (orderedTopCopy) {
+          // Consume exactly the first physical copy in a shuffled/sorted deck.
+          // If its recipe was edited after ordering, discard the stale entry.
+          await txn.runAsync(
+            'DELETE FROM gameplay_tile_deck_order WHERE id = ? AND project_id = ?',
+            orderedTopCopy.id,
+            projectId
+          );
+        }
         tileResult.value = {
           id: tileRow.id, name: tileRow.name, shape: tileRow.shape,
           widthInches: tileRow.width_inches, heightInches: tileRow.height_inches,
@@ -1594,9 +1671,22 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           0,
           availableTiles.reduce((count, tile) => count + tile.remaining_quantity, 0) - 1
         );
-        const nextRow = tileRow.remaining_quantity > 1
-          ? tileRow
-          : availableTilesWithStock[1] ?? null;
+        const afterDrawTiles = availableTiles
+          .map((tile) => ({
+            ...tile,
+            remaining_quantity: tile.remaining_quantity - (tile.id === tileRow.id ? 1 : 0),
+          }))
+          .filter((tile) => tile.remaining_quantity > 0);
+        const orderedNextCopy = await txn.getFirstAsync<{ tile_id: number }>(
+          `SELECT tile_id FROM gameplay_tile_deck_order
+           WHERE project_id = ? AND deck_id = ? AND tile_id IS NOT NULL
+           ORDER BY order_index, id LIMIT 1`,
+          projectId,
+          deckId
+        );
+        const nextRow = orderedNextCopy
+          ? afterDrawTiles.find((tile) => tile.id === orderedNextCopy.tile_id) ?? afterDrawTiles[0] ?? null
+          : afterDrawTiles[0] ?? null;
         nextTileResult.value = nextRow ? {
           id: nextRow.id, name: nextRow.name, shape: nextRow.shape,
           widthInches: nextRow.width_inches, heightInches: nextRow.height_inches,
@@ -2075,6 +2165,24 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
                quantity = gameplay_tile_deck_returns.quantity + 1, updated_at = excluded.updated_at`,
               projectId, deckId, placement.tileId, Date.now()
             );
+            const explicitOrder = await db.getFirstAsync<{ id: number }>(
+              `SELECT id FROM gameplay_tile_deck_order
+               WHERE project_id = ? AND deck_id = ? AND tile_id IS NULL LIMIT 1`,
+              projectId,
+              deckId
+            );
+            if (explicitOrder) {
+              await db.runAsync(
+                `INSERT INTO gameplay_tile_deck_order (project_id, deck_id, tile_id, order_index)
+                 VALUES (?, ?, ?, COALESCE((SELECT MAX(order_index) + 1
+                   FROM gameplay_tile_deck_order WHERE project_id = ? AND deck_id = ?), 0))`,
+                projectId,
+                deckId,
+                placement.tileId,
+                projectId,
+                deckId
+              );
+            }
             await db.runAsync(
               `INSERT INTO gameplay_tile_placement_states
                 (project_id, placement_id, x, y, orientation, face_up, is_returned, returned_deck_id)
@@ -2611,7 +2719,8 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
 
       onHandCardDropResolved?.(
         { requestId: handCardDropRequest.requestId, cardInstanceId: handCardDropRequest.cardInstanceId },
-        spot?.id ?? null
+        spot?.id ?? null,
+        insideCanvas ? point : null
       );
     });
   }, [canvasSize.height, canvasSize.width, coordinateScale, deckSpots, gameplayMode, handCardDropRequest, onHandCardDropResolved]);
@@ -2751,9 +2860,8 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         14 / (zoomRef.current * coordinateScale)
       );
       if (tileDeckHit?.deckId !== null && tileDeckHit?.deckId !== undefined) {
-        // A tap is inert for every tile pile. Only a drag past the release
-        // threshold takes a tile, and empty piles have nothing to drag.
-        if (tileDeckHit.tileCount <= 0 || !tileDeckHit.tile) return;
+        // A tap opens this deck's order controls. Only a drag past the release
+        // threshold takes a tile, so tapping can never draw one by accident.
         clearGameplayDieSelection();
         setSelectedBoardTokenId(null);
         setSelectedBoardTilePlacementId(null);
@@ -2761,12 +2869,11 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           kind: 'tile', sourceId: tileDeckHit.deckId,
           startPoint: point, updatedPoint: point, changed: false,
         };
-        // Keep the tile artwork hidden until a real drag begins. This gives
-        // the player a centered preview to follow without creating a popup on
-        // a simple tap.
-        pendingGameplayTakePreviewRef.current = {
-          kind: 'tile', sourceId: tileDeckHit.deckId, tile: tileDeckHit.tile, startPoint: point,
-        };
+        // Keep artwork hidden until a real drag begins. Empty decks still get
+        // a tap session so their order controls remain available.
+        pendingGameplayTakePreviewRef.current = tileDeckHit.tile && tileDeckHit.tileCount > 0
+          ? { kind: 'tile', sourceId: tileDeckHit.deckId, tile: tileDeckHit.tile, startPoint: point }
+          : null;
         activePieceOffsetX.value = 0;
         activePieceOffsetY.value = 0;
         activePieceRotation.value = tileDeckHit.orientation;
@@ -2842,10 +2949,10 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         return;
       }
       const spot = findDeckSpotAtPoint(deckSpots, point, 14 / (zoomRef.current * coordinateScale));
-      if (spot?.cardCount && spot.topCard) {
+      if (spot) {
         clearGameplayDieSelection();
-        // The card moves as a lightweight preview; the pile itself stays put
-        // until a valid drop destination is found on release.
+        // A tap opens this pile's order controls. A real drag moves the top
+        // card as a lightweight preview until a drop destination is found.
         deckCardDragSessionRef.current = {
           sourceSpotId: spot.id,
           startPoint: point,
@@ -2853,7 +2960,9 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           screenY: y,
           changed: false,
         };
-        pendingDeckCardDragPreviewRef.current = { spot, startPoint: point };
+        pendingDeckCardDragPreviewRef.current = spot.cardCount && spot.topCard
+          ? { spot, startPoint: point }
+          : null;
         activePieceOffsetX.value = 0;
         activePieceOffsetY.value = 0;
         activePieceRotation.value = spot.orientation;
@@ -3151,7 +3260,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           center,
           startPoint: point,
           resizeStartDistance: startedOnHandle
-            ? Math.max(1, Math.hypot(point.x - center.x, point.y - center.y))
+            ? Math.max(0.001, Math.hypot(point.x - center.x, point.y - center.y))
             : undefined,
           changed: false,
         };
@@ -3205,7 +3314,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         startPoint: point,
         resizeStartDistance: startedOnHandle
           ? Math.max(
-              1,
+              0.001,
               Math.hypot(point.x - center.x, point.y - center.y)
             )
           : undefined,
@@ -3646,19 +3755,28 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       activePieceOffsetX.value = 0;
       activePieceOffsetY.value = 0;
     }
-    if (gameplayMode && deckCardSession?.changed) {
-      const targetSpot = findDeckSpotAtPoint(
-        deckSpots,
-        deckCardSession.updatedPoint,
-        16 / (zoomRef.current * coordinateScale)
-      );
-      rootViewRef.current?.measureInWindow((_originX, originY) => {
-        onDeckCardDragRequest?.(
-          deckCardSession.sourceSpotId,
-          targetSpot?.id ?? null,
-          originY + deckCardSession.screenY
+    if (gameplayMode && deckCardSession) {
+      if (deckCardSession.changed) {
+        const targetSpot = findDeckSpotAtPoint(
+          deckSpots,
+          deckCardSession.updatedPoint,
+          16 / (zoomRef.current * coordinateScale)
         );
-      });
+        // Empty card piles can still be tapped to open their order controls,
+        // but dragging from them has no card to draw.
+        if (deckSpots.find((spot) => spot.id === deckCardSession.sourceSpotId)?.cardCount) {
+          rootViewRef.current?.measureInWindow((_originX, originY) => {
+            onDeckCardDragRequest?.(
+              deckCardSession.sourceSpotId,
+              targetSpot?.id ?? null,
+            originY + deckCardSession.screenY,
+            deckCardSession.updatedPoint
+            );
+          });
+        }
+      } else {
+        onDeckOrderRequested?.('card', deckCardSession.sourceSpotId);
+      }
     }
     const takeSession = gameplayTakeDragSessionRef.current;
     gameplayTakeDragSessionRef.current = null;
@@ -3672,9 +3790,14 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       if (takeSession?.changed) {
         if (takeSession.kind === 'token') {
           void takeGameplayTokenFromSupply(takeSession.updatedPoint, takeSession.sourceId);
-        } else {
-          void takeGameplayTileFromDeck(takeSession.updatedPoint, takeSession.sourceId);
+        } else if (takeSession.kind === 'tile') {
+          const tileDeck = boardTilePlacements.find((placement) => placement.deckId === takeSession.sourceId);
+          if (tileDeck?.tileCount && tileDeck.tile) {
+            void takeGameplayTileFromDeck(takeSession.updatedPoint, takeSession.sourceId);
+          }
         }
+      } else if (takeSession?.kind === 'tile') {
+        onDeckOrderRequested?.('tile', takeSession.sourceId);
       }
     }
     if (tilePlacementSessionRef.current) {
@@ -3901,7 +4024,11 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   const editPinchGesture = usePinchGesture({
     enabled: isEditingSymbols,
     runOnJS: true,
-    onActivate: () => {
+    onActivate: (event) => {
+      // The recognizer may activate after its scale has already moved away
+      // from 1. Treat the activation size as neutral so the artwork does not
+      // jump toward the minimum as soon as the pinch starts.
+      const startScale = Number.isFinite(event.scale) && event.scale > 0 ? event.scale : 1;
       const selectedImage = placedImages.find((image) => image.id === selectedImageId);
       if (selectedImage) {
         imagePinchSessionRef.current = {
@@ -3910,6 +4037,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           updatedImage: selectedImage,
           center: selectedImage.center,
           startPoint: { x: 0, y: 0 },
+          startScale,
           changed: false,
         };
         symbolPinchSessionRef.current = null;
@@ -3933,13 +4061,14 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           y: (bounds.top + bounds.bottom) / 2,
         },
         startPoint: { x: 0, y: 0 },
+        startScale,
         changed: false,
       };
     },
     onUpdate: (event) => {
       const imageSession = imagePinchSessionRef.current;
       if (imageSession) {
-        const scale = Math.max(0.2, Math.min(5, event.scale));
+        const scale = Math.max(0.2, Math.min(5, event.scale / (imageSession.startScale ?? 1)));
         const updatedImage = {
           ...imageSession.baseImage,
           width: imageSession.baseImage.width * scale,
@@ -3961,7 +4090,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       if (!session) return;
       scheduleMovePreview(() => {
         if (symbolPinchSessionRef.current !== session) return;
-        const scale = Math.max(0.25, Math.min(4, event.scale));
+        const scale = Math.max(0.25, Math.min(4, event.scale / (session.startScale ?? 1)));
         const resizedStrokes = transformSymbolStrokes(
           session.baseStrokes,
           session.center,

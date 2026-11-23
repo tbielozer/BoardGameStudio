@@ -432,6 +432,8 @@ async function initializeDatabase(db: SQLiteDatabase) {
       card_id INTEGER NOT NULL,
       deck_spot_id INTEGER,
       player_id INTEGER,
+      gameplay_pile_id INTEGER,
+      gameplay_pile_order INTEGER,
       face_up INTEGER NOT NULL DEFAULT 0,
       hand_order INTEGER NOT NULL DEFAULT 0,
       pile_order INTEGER NOT NULL DEFAULT 0,
@@ -439,6 +441,17 @@ async function initializeDatabase(db: SQLiteDatabase) {
       FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE,
       FOREIGN KEY (deck_spot_id) REFERENCES deck_spots(id) ON DELETE CASCADE,
       FOREIGN KEY (player_id) REFERENCES game_players(id) ON DELETE CASCADE
+    );
+
+    -- Loose cards and piles created during play exist only in the live game.
+    CREATE TABLE IF NOT EXISTS gameplay_card_piles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      x REAL NOT NULL,
+      y REAL NOT NULL,
+      orientation REAL NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
     );
 
     -- Named snapshots let a project keep multiple gameplay runs while the board
@@ -494,6 +507,20 @@ async function initializeDatabase(db: SQLiteDatabase) {
       quantity INTEGER NOT NULL CHECK (quantity > 0),
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (project_id, deck_id, tile_id),
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (deck_id) REFERENCES tile_decks(id) ON DELETE CASCADE,
+      FOREIGN KEY (tile_id) REFERENCES game_tiles(id) ON DELETE CASCADE
+    );
+    -- A marker row (tile_id IS NULL) records that a live tile deck has an
+    -- explicit order, even when it is temporarily empty. Each non-null row is
+    -- one physical tile copy in that game's current shuffled/sorted order.
+    CREATE TABLE IF NOT EXISTS gameplay_tile_deck_order (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      deck_id INTEGER NOT NULL,
+      tile_id INTEGER,
+      order_index INTEGER NOT NULL,
+      UNIQUE(project_id, deck_id, order_index),
       FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
       FOREIGN KEY (deck_id) REFERENCES tile_decks(id) ON DELETE CASCADE,
       FOREIGN KEY (tile_id) REFERENCES game_tiles(id) ON DELETE CASCADE
@@ -554,6 +581,22 @@ async function initializeDatabase(db: SQLiteDatabase) {
 
   // These runtime tables are created in newer schemas. Add their columns to
   // databases that already had the simpler transform-and-return records.
+  const playCardInstanceColumns = await db.getAllAsync<{ name: string }>(
+    'PRAGMA table_info(play_card_instances)'
+  );
+  if (!playCardInstanceColumns.some((column) => column.name === 'gameplay_pile_id')) {
+    await db.execAsync('ALTER TABLE play_card_instances ADD COLUMN gameplay_pile_id INTEGER');
+  }
+  if (!playCardInstanceColumns.some((column) => column.name === 'gameplay_pile_order')) {
+    await db.execAsync('ALTER TABLE play_card_instances ADD COLUMN gameplay_pile_order INTEGER');
+  }
+  await db.execAsync(`
+    CREATE INDEX IF NOT EXISTS idx_play_cards_gameplay_pile_order
+      ON play_card_instances(project_id, gameplay_pile_id, gameplay_pile_order, id);
+    CREATE INDEX IF NOT EXISTS idx_gameplay_card_piles_project
+      ON gameplay_card_piles(project_id, id);
+  `);
+
   const gameplayTileStateColumns = await db.getAllAsync<{ name: string }>(
     'PRAGMA table_info(gameplay_tile_placement_states)'
   );
@@ -763,6 +806,8 @@ async function initializeDatabase(db: SQLiteDatabase) {
       ON play_card_instances(deck_spot_id, player_id, pile_order, id);
     CREATE INDEX IF NOT EXISTS idx_play_cards_hand_order
       ON play_card_instances(project_id, player_id, hand_order, id);
+    CREATE INDEX IF NOT EXISTS idx_gameplay_tile_deck_order
+      ON gameplay_tile_deck_order(project_id, deck_id, order_index, id);
     CREATE INDEX IF NOT EXISTS idx_deck_spots_surface
       ON deck_spots(surface_id, id);
     CREATE INDEX IF NOT EXISTS idx_tile_board_surface
@@ -1764,13 +1809,16 @@ function AppContent() {
           onStopEditingSymbols={() => setIsEditingSymbols(false)}
             gameplayMode={isPlaying}
             gameplayDrawFaceUp={gameplayDrawFaceUp}
-            onDeckCardDragRequest={(sourceSpotId, targetSpotId, absoluteY) => {
-              gameplayRef.current?.resolveDeckCardDrop(sourceSpotId, targetSpotId, absoluteY);
+            onDeckCardDragRequest={(sourceSpotId, targetSpotId, absoluteY, dropPoint) => {
+              gameplayRef.current?.resolveDeckCardDrop(sourceSpotId, targetSpotId, absoluteY, dropPoint);
+            }}
+            onDeckOrderRequested={(kind, deckId) => {
+              gameplayRef.current?.openDeckOrderManager(kind, deckId);
             }}
             handCardDropRequest={handCardDropRequest ?? undefined}
-            onHandCardDropResolved={(request, deckSpotId) => {
+            onHandCardDropResolved={(request, deckSpotId, dropPoint) => {
               setHandCardDropRequest((current) => current?.requestId === request.requestId ? null : current);
-              gameplayRef.current?.resolveHandCardDrop(request.cardInstanceId, deckSpotId);
+              gameplayRef.current?.resolveHandCardDrop(request.cardInstanceId, deckSpotId, dropPoint);
             }}
         />
 

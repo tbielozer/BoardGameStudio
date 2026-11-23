@@ -15,6 +15,8 @@ export type SymbolTransformSession = {
   startPoint: Point;
   /** Present when a corner handle starts a drag, so that drag scales instead of moves. */
   resizeStartDistance?: number;
+  /** Pinch scale at activation; used as the neutral size for this gesture. */
+  startScale?: number;
   changed: boolean;
 };
 
@@ -216,6 +218,7 @@ export type ImageTransformSession = {
   center: Point;
   startPoint: Point;
   resizeStartDistance?: number;
+  startScale?: number;
   changed: boolean;
 };
 
