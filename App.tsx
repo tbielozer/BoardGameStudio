@@ -1,4 +1,4 @@
-import { Alert, Modal, Pressable, ScrollView, Text, TextInput, View, useWindowDimensions } from 'react-native';
+import { Alert, Modal, Platform, Pressable, ScrollView, Text, TextInput, View, useWindowDimensions } from 'react-native';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
@@ -111,6 +111,14 @@ type ProjectRow = {
 const SYMBOL_CANVAS_SIZE = 300;
 
 async function initializeDatabase(db: SQLiteDatabase) {
+  // Gameplay writes use withExclusiveTransactionAsync, which opens a second
+  // native connection. WAL lets that writer run while the main connection keeps
+  // reading the board, instead of failing with "database is locked".
+  // Connection settings must run outside any transaction. Web uses wa-sqlite,
+  // which does not support WAL.
+  if (Platform.OS !== 'web') {
+    await db.execAsync('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
+  }
   await db.execAsync(`
     PRAGMA foreign_keys = ON;
 
@@ -824,6 +832,10 @@ function AppContent() {
   const notifyGameplayStateChanged = useCallback(() => {
     boardCanvasRef.current?.refreshGameplayState();
   }, []);
+  const waitForBoardWrites = useCallback(
+    () => boardCanvasRef.current?.waitForPendingWrites() ?? Promise.resolve(),
+    []
+  );
 
   // createMenuOpen controls whether the create-game dropdown menu is visible.
   // This is a true/false state value.
@@ -1781,6 +1793,7 @@ function AppContent() {
             }}
             onBoardPilesChanged={notifyGameplayPilesChanged}
             onGameplayStateChanged={notifyGameplayStateChanged}
+            waitForBoardWrites={waitForBoardWrites}
             onHandCardDropRequest={(cardInstanceId, absoluteX, absoluteY) => {
               handDropRequestCounterRef.current += 1;
               setHandCardDropRequest({

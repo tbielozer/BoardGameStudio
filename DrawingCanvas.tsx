@@ -92,6 +92,8 @@ export type DrawingCanvasHandle = {
   refreshGameplayPiles: (spotIds?: number[]) => void;
   /** Refresh board pieces after loading or resetting a saved game. */
   refreshGameplayState: () => void;
+  /** Resolve once every queued board write (piece moves, rolls, returns) has finished. */
+  waitForPendingWrites: () => Promise<void>;
 };
 
 type DrawingCanvasProps = {
@@ -1356,7 +1358,8 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     tile: BoardTileVisual | null,
     deck: BoardTileDeckPlacement | null
   ) => {
-    if (surfaceId === undefined || (!tile && !deck)) return;
+    // Play mode must never edit the saved board setup (see gameplay_* tables).
+    if (gameplayMode || surfaceId === undefined || (!tile && !deck)) return;
     const snapThreshold = Math.max(24, Math.min(getBoardTileSize(tile).width, getBoardTileSize(tile).height) * 0.45);
     const snapPoint = findNearestTileSnapPointInGrid(gameplaySnapGrid, point, snapThreshold);
     const placementPoint = snapPoint ? { x: snapPoint.x, y: snapPoint.y } : point;
@@ -1387,9 +1390,11 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       console.error('Could not place tile on the board:', error);
       Alert.alert('Could not place tile', 'Please try again.');
     });
-  }, [db, gameplaySnapGrid, onTileDeckPlaced, onTilePlaced, surfaceId, tileSnapPoints]);
+  }, [db, gameplayMode, gameplaySnapGrid, onTileDeckPlaced, onTilePlaced, surfaceId, tileSnapPoints]);
 
   const placeTokenSupply = useCallback((point: Point, supply: BoardTokenSupply) => {
+    // Play mode must never edit the saved board setup (see gameplay_* tables).
+    if (gameplayMode) return;
     if (surfaceId === undefined) return;
     void db.runAsync(
       `INSERT INTO token_supply_placements (surface_id, token_id, x, y, orientation, quantity)
@@ -1408,9 +1413,11 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       console.error('Could not place token supply:', error);
       Alert.alert('Could not place token supply', 'Please try again.');
     });
-  }, [db, surfaceId]);
+  }, [db, gameplayMode, surfaceId]);
 
   const placeBoardToken = useCallback((point: Point, token: BoardTileVisual) => {
+    // Play mode must never edit the saved board setup (see gameplay_* tables).
+    if (gameplayMode) return;
     if (surfaceId === undefined) return;
     void db.runAsync(
       `INSERT INTO token_board_placements (surface_id, token_id, x, y, orientation, face_up)
@@ -1429,7 +1436,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       console.error('Could not place token:', error);
       Alert.alert('Could not place token', 'Please try again.');
     });
-  }, [db, surfaceId]);
+  }, [db, gameplayMode, surfaceId]);
 
   // Play mode withdraws exactly one token from the chosen supply and places it
   // where the player taps. The added marker and its stock change are saved as
@@ -1600,6 +1607,8 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   }, [boardTilePlacements, db, gameplaySnapGrid, surfaceId, tileSnapPoints]);
 
   const placeBoardDie = useCallback((point: Point, die: BoardDieVisual) => {
+    // Play mode must never edit the saved board setup (see gameplay_* tables).
+    if (gameplayMode) return;
     if (surfaceId === undefined) return;
     void db.runAsync(
       'INSERT INTO die_board_placements (surface_id, die_id, face_number, x, y, orientation) VALUES (?, ?, 1, ?, ?, 0)',
@@ -1617,12 +1626,13 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       console.error('Could not place die:', error);
       Alert.alert('Could not place die', 'Please try again.');
     });
-  }, [db, surfaceId]);
+  }, [db, gameplayMode, surfaceId]);
 
   const queueTokenMarkerSave = useCallback((session: TokenMarkerDragSession) => {
     if (surfaceId === undefined) return;
     enqueueDatabaseAction(async () => {
       if (session.kind === 'supply') {
+        if (gameplayMode) return;
         await db.runAsync(
           'UPDATE token_supply_placements SET x = ?, y = ? WHERE id = ? AND surface_id = ?',
           session.updatedX, session.updatedY, session.id, surfaceId
@@ -1646,7 +1656,8 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
             session.updatedX, session.updatedY, session.id, surfaceId
           );
         }
-      } else {
+      } else if (!gameplayMode) {
+        // Dice stay where the creator put them during play; only rolls are saved.
         await db.runAsync(
           'UPDATE die_board_placements SET x = ?, y = ? WHERE id = ? AND surface_id = ?',
           session.updatedX, session.updatedY, session.id, surfaceId
@@ -1707,6 +1718,8 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   }, [gameplayMode, queueTokenMarkerSave]);
 
   const removeSelectedTokenMarker = useCallback(() => {
+    // Play mode must never edit the saved board setup (see gameplay_* tables).
+    if (gameplayMode) return;
     const supplyId = selectedTokenSupplyId;
     const tokenId = selectedBoardTokenId;
     const dieId = selectedBoardDieId;
@@ -1730,7 +1743,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         await db.runAsync('DELETE FROM die_board_placements WHERE id = ? AND surface_id = ?', dieId, surfaceId);
       }, 'Could not remove die:');
     }
-  }, [db, enqueueDatabaseAction, selectedBoardDieId, selectedBoardTokenId, selectedTokenSupplyId, surfaceId]);
+  }, [db, enqueueDatabaseAction, gameplayMode, selectedBoardDieId, selectedBoardTokenId, selectedTokenSupplyId, surfaceId]);
 
   const flipSelectedBoardToken = useCallback(() => {
     const placement = boardTokenPlacements.find((item) => item.id === selectedBoardTokenId);
@@ -1785,7 +1798,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     if (surfaceId === undefined) return;
     if (selectedBoardDieId !== null) {
       const placement = boardDiePlacements.find((item) => item.id === selectedBoardDieId);
-      if (!placement) return;
+      if (!placement || gameplayMode) return;
       const rotated = { ...placement, orientation: (placement.orientation + 15) % 360 };
       setBoardDiePlacements((current) => current.map((item) => item.id === rotated.id ? rotated : item));
       enqueueDatabaseAction(async () => {
@@ -1803,16 +1816,18 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     }
     if (selectedTokenSupplyId !== null) {
       const placement = tokenSupplyPlacements.find((item) => item.id === selectedTokenSupplyId);
-      if (!placement) return;
+      if (!placement || gameplayMode) return;
       const rotated = { ...placement, orientation: (placement.orientation + 15) % 360 };
       setTokenSupplyPlacements((current) => current.map((item) => item.id === rotated.id ? rotated : item));
       enqueueDatabaseAction(async () => {
         await db.runAsync('UPDATE token_supply_placements SET orientation = ? WHERE id = ? AND surface_id = ?', rotated.orientation, rotated.id, surfaceId);
       }, 'Could not rotate token supply:');
     }
-  }, [boardDiePlacements, boardTokenPlacements, db, enqueueDatabaseAction, queueBoardTokenPlacementSave, selectedBoardDieId, selectedBoardTokenId, selectedTokenSupplyId, surfaceId, tokenSupplyPlacements]);
+  }, [boardDiePlacements, boardTokenPlacements, db, enqueueDatabaseAction, gameplayMode, queueBoardTokenPlacementSave, selectedBoardDieId, selectedBoardTokenId, selectedTokenSupplyId, surfaceId, tokenSupplyPlacements]);
 
   const changeSelectedDieFace = useCallback((direction: number) => {
+    // Play mode must never edit the saved board setup (see gameplay_* tables).
+    if (gameplayMode) return;
     const placement = boardDiePlacements.find((item) => item.id === selectedBoardDieId);
     if (!placement || surfaceId === undefined) return;
     const faceNumber = ((placement.faceNumber - 1 + direction + placement.die.sideCount) % placement.die.sideCount) + 1;
@@ -1821,7 +1836,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     enqueueDatabaseAction(async () => {
       await db.runAsync('UPDATE die_board_placements SET face_number = ? WHERE id = ? AND surface_id = ?', faceNumber, updated.id, surfaceId);
     }, 'Could not change die face:');
-  }, [boardDiePlacements, db, enqueueDatabaseAction, selectedBoardDieId, surfaceId]);
+  }, [boardDiePlacements, db, enqueueDatabaseAction, gameplayMode, selectedBoardDieId, surfaceId]);
 
   // A play-mode roll updates every selected die together and saves each result,
   // so the shown faces remain part of the current game state.
@@ -1970,6 +1985,8 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
   }, [activePieceOffsetX, activePieceOffsetY, activePieceRotation, gameplayMode, gameplaySnapGrid, gameplayTileDragState, queueBoardTilePlacementSave]);
 
   const removeSelectedBoardTile = useCallback(() => {
+    // Play mode must never edit the saved board setup (see gameplay_* tables).
+    if (gameplayMode) return;
     if (selectedBoardTilePlacementId === null) return;
     const id = selectedBoardTilePlacementId;
     setBoardTilePlacements((current) => current.filter((placement) => placement.id !== id));
@@ -1979,7 +1996,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         await db.runAsync('DELETE FROM tile_board_placements WHERE id = ? AND surface_id = ?', id, surfaceId);
       }, 'Could not remove tile from the board:');
     }
-  }, [db, enqueueDatabaseAction, selectedBoardTilePlacementId, surfaceId]);
+  }, [db, enqueueDatabaseAction, gameplayMode, selectedBoardTilePlacementId, surfaceId]);
 
   const rotateSelectedBoardTile = useCallback(() => {
     const placement = boardTilePlacements.find((item) => item.id === selectedBoardTilePlacementId);
@@ -2297,6 +2314,9 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       setGameplayPileRefreshIds(null);
       setGameplayPileRevision((revision) => revision + 1);
     },
+    // The queue never rejects (each action catches its own error), so callers
+    // can await it before snapshotting or resetting gameplay tables.
+    waitForPendingWrites: () => databaseActionQueueRef.current,
   }), [importImage]);
 
   const finishSymbolDrag = useCallback(() => {
