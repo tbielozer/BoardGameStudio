@@ -3,6 +3,7 @@ import { Alert, Modal, Pressable, ScrollView, Text, TextInput, View } from 'reac
 import Slider from '@react-native-community/slider';
 import { useSQLiteContext } from 'expo-sqlite';
 import { DrawingCanvas, type DrawingCanvasHandle } from './DrawingCanvas';
+import { invalidateSurfaceArtworkCache } from './surfaceArtworkCache';
 import { tileEditorStyles as s } from './tileEditorStyles';
 
 type TokenShape = 'circle' | 'square' | 'hexagon' | 'triangle';
@@ -201,6 +202,8 @@ export function TokenEditor({ projectId, symbols, topInset, bottomInset, onClose
         'UPDATE drawing_surfaces SET name = ?, background_color = ? WHERE id = ?',
         `${name} Back`, tokenColor, activeToken.back_surface_id
       );
+      invalidateSurfaceArtworkCache(activeToken.surface_id);
+      if (activeToken.back_surface_id) invalidateSurfaceArtworkCache(activeToken.back_surface_id);
       setSizeDialogOpen(false);
       await loadTokens();
     } catch (error) {
@@ -281,6 +284,7 @@ export function TokenEditor({ projectId, symbols, topInset, bottomInset, onClose
           image.center_y, image.width, image.height, image.order_index
         );
       }
+      invalidateSurfaceArtworkCache(backSurfaceId);
       setCanvasRevision((revision) => revision + 1);
       setSavedBackLibraryOpen(false);
     } catch (error) {

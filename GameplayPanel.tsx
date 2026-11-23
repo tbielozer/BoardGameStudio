@@ -206,6 +206,9 @@ export const GameplayPanel = forwardRef<GameplayPanelHandle, GameplayPanelProps>
     const spots = await db.getAllAsync<{ id: number; deck_id: number; face_up: number }>(
       `SELECT spot.id, spot.deck_id, spot.face_up FROM deck_spots AS spot
       WHERE spot.surface_id = ? AND spot.spot_type = 'deck' AND spot.deck_id IS NOT NULL
+        -- A marker can outlive its deck. Seeding it would break the
+        -- play_initialized_spots foreign key and roll back every other pile.
+        AND EXISTS (SELECT 1 FROM card_decks AS deck WHERE deck.id = spot.deck_id)
         AND NOT EXISTS (
           SELECT 1 FROM play_initialized_spots AS done
           WHERE done.project_id = ? AND done.spot_id = spot.id
@@ -276,6 +279,8 @@ export const GameplayPanel = forwardRef<GameplayPanelHandle, GameplayPanelProps>
         }
       } catch (error) {
         console.error('Could not load gameplay state:', error);
+        // Don't leave play stuck in "preparing", which blocks every card draw.
+        if (!cancelled) setIsPreparingGame(false);
         Alert.alert('Could not start game', 'The saved deck data could not be loaded.');
       }
     })();

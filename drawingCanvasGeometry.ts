@@ -29,6 +29,33 @@ export function pointsToPath(points: Point[]) {
   return path.build();
 }
 
+// Outline of a tile, token, or card face drawn into a width x height box.
+export function makeTileShapePath(
+  shape: 'hexagon' | 'square' | 'triangle' | 'circle',
+  width: number,
+  height: number
+) {
+  const path = Skia.PathBuilder.Make();
+  if (shape === 'circle') {
+    path.addOval({ x: 0, y: 0, width, height });
+  } else if (shape === 'square') {
+    path.addRect({ x: 0, y: 0, width, height });
+  } else {
+    const points = shape === 'hexagon'
+      ? [
+          { x: width * 0.25, y: 0 }, { x: width * 0.75, y: 0 }, { x: width, y: height * 0.5 },
+          { x: width * 0.75, y: height }, { x: width * 0.25, y: height }, { x: 0, y: height * 0.5 },
+        ]
+      : [{ x: width * 0.5, y: 0 }, { x: width, y: height }, { x: 0, y: height }];
+    points.forEach((point, index) => {
+      if (index === 0) path.moveTo(point.x, point.y);
+      else path.lineTo(point.x, point.y);
+    });
+    path.close();
+  }
+  return path.build();
+}
+
 export function getStrokeBounds(strokes: Stroke[]): StrokeBounds | null {
   let bounds: StrokeBounds | null = null;
   for (const stroke of strokes) {

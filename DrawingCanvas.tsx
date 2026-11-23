@@ -2257,7 +2257,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         x: (canvasSize.width / 2 - boardOffsetRef.current.x) / transformScale,
         y: (canvasSize.height / 2 - boardOffsetRef.current.y) / transformScale,
       };
-      const mimeType = 'image/jpeg';
+      const mimeType = asset.mimeType ?? 'image/jpeg';
       const insertResult = await db.runAsync(
         `INSERT INTO surface_images
           (surface_id, base64_data, mime_type, center_x, center_y,
@@ -4507,13 +4507,17 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
       {/* Apply the polygon cutout against the measured canvas host, not the
           gesture child's content bounds. This keeps the whole drawing surface
           hidden outside the tile, including marks that continue past an edge. */}
+      {/* Skia's Canvas ignores pointerEvents on web, so a wrapping View keeps
+          this overlay from swallowing every touch meant for the drawing area. */}
       {tileShapeOverlay && (
-        <Canvas pointerEvents="none" style={StyleSheet.absoluteFill}>
-          {tileShapeOverlay.masks.map((path, index) => (
-            <Path key={`tile-shape-mask-${index}`} path={path} color="#E5E7EB" />
-          ))}
-          <Path path={tileShapeOverlay.outline} color="#6B7280" style="stroke" strokeWidth={2} />
-        </Canvas>
+        <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+          <Canvas style={StyleSheet.absoluteFill}>
+            {tileShapeOverlay.masks.map((path, index) => (
+              <Path key={`tile-shape-mask-${index}`} path={path} color="#E5E7EB" />
+            ))}
+            <Path path={tileShapeOverlay.outline} color="#6B7280" style="stroke" strokeWidth={2} />
+          </Canvas>
+        </View>
       )}
 
       {!gameplayMode && placementSymbolId !== undefined && (

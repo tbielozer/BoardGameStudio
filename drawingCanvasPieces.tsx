@@ -1,30 +1,23 @@
 import { memo, useEffect, useMemo, useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
-import { Canvas, Path, Skia, Circle, Group, Image as SkiaImage, Mask, Rect, ImageFormat, useCanvasRef } from '@shopify/react-native-skia';
+import { Canvas, Path, Image as SkiaImage } from '@shopify/react-native-skia';
 import type { SkImage } from '@shopify/react-native-skia';
 import { useSQLiteContext } from 'expo-sqlite';
 import Animated, { useAnimatedStyle } from 'react-native-reanimated';
-import type { Stroke } from './types';
 import type {
   BoardTilePlacement,
   BoardTileVisual,
   DeckSpot,
-  PlacedImage,
   TilePlacementPreview,
 } from './drawingCanvasTypes';
-import { getBoardTileSize, getDeckSpotSize, pointsToPath } from './drawingCanvasGeometry';
+import { getBoardTileSize, getDeckSpotSize, makeTileShapePath } from './drawingCanvasGeometry';
 import {
-  cacheSurfaceRaster,
   getCachedSurfaceRaster,
-  loadCachedSurfaceRaster,
-  loadSurfaceArtwork,
-  pendingSurfaceRasterCaptures,
-  subscribeToSurfaceRaster,
-  surfaceArtworkGenerations,
-  tileArtworkImageCache,
-  tileArtworkPathCache,
+  getSurfaceRasterKey,
+  loadSurfaceRaster,
+  subscribeToSurfaceArtwork,
 } from './surfaceArtworkCache';
-import type { DecodedTileArtwork } from './surfaceArtworkCache';
+import type { SurfaceRasterSpec } from './surfaceArtworkCache';
 import { drawingCanvasStyles } from './drawingCanvasStyles';
 
 // Renders a saved tile face at its physical shape and aspect ratio on the board.
@@ -134,154 +127,53 @@ export const BoardTileArtworkPreview = memo(function BoardTileArtworkPreview({
   drawErasers?: boolean;
 }) {
   const db = useSQLiteContext();
-  const canvasRef = useCanvasRef();
   const artworkSurfaceId = !faceUp && tile.backSurfaceId
     ? tile.backSurfaceId
     : tile.frontSurfaceId;
-  const rasterVariant = `${tile.shape}|${tile.widthInches}|${tile.heightInches}|${tile.color}|erasers:${Number(drawErasers)}`;
-  const rasterKey = `${artworkSurfaceId}|${rasterVariant}`;
-  const [artwork, setArtwork] = useState<{
-    backgroundColor: string;
-    backgroundImage: { base64Data: string; mimeType: string } | null;
-    strokes: Stroke[];
-    images: PlacedImage[];
-  } | null>(null);
-  const [flattenedArtwork, setFlattenedArtwork] = useState<SkImage | null>(null);
+  const rasterSpec = useMemo<SurfaceRasterSpec>(() => ({
+    surfaceId: artworkSurfaceId,
+    shape: tile.shape,
+    widthInches: tile.widthInches,
+    heightInches: tile.heightInches,
+    fallbackColor: tile.color,
+    drawErasers,
+  }), [artworkSurfaceId, drawErasers, tile.color, tile.heightInches, tile.shape, tile.widthInches]);
+  const rasterKey = getSurfaceRasterKey(rasterSpec);
+  // Every placement of the same face shares one flattened image, drawn once
+  // from the saved artwork and then reused from memory or SQLite.
+  const [flattened, setFlattened] = useState<{ key: string; image: SkImage | null }>(() => ({
+    key: rasterKey,
+    image: getCachedSurfaceRaster(rasterKey),
+  }));
+
+  // Bumped when this face is edited, so a preview that stays mounted (for
+  // example on the board behind an editor) re-renders the new artwork.
+  const [artworkRevision, setArtworkRevision] = useState(0);
+  useEffect(
+    () => subscribeToSurfaceArtwork(artworkSurfaceId, () => setArtworkRevision((revision) => revision + 1)),
+    [artworkSurfaceId]
+  );
 
   useEffect(() => {
     let cancelled = false;
-    setArtwork(null);
-    setFlattenedArtwork(null);
-    const loadArtwork = async () => {
-      try {
-        const loaded = await loadSurfaceArtwork(db, artworkSurfaceId);
-        if (!cancelled) setArtwork({ ...loaded, backgroundColor: loaded.backgroundColor ?? tile.color });
-      } catch (error) {
-        console.error('Could not load tile artwork for the board:', error);
-      }
-    };
-    void loadCachedSurfaceRaster(db, rasterKey, artworkSurfaceId, rasterVariant).then((cachedRaster) => {
-      if (cancelled) return;
-      if (cachedRaster) setFlattenedArtwork(cachedRaster);
-      else void loadArtwork();
-    });
-    return () => { cancelled = true; };
-  }, [artworkSurfaceId, db, rasterKey, rasterVariant, tile.color]);
-
-  useEffect(() => {
-    if (flattenedArtwork) return;
     const cached = getCachedSurfaceRaster(rasterKey);
     if (cached) {
-      setFlattenedArtwork(cached);
+      setFlattened((current) => current.key === rasterKey && current.image === cached
+        ? current
+        : { key: rasterKey, image: cached });
       return;
     }
-    return subscribeToSurfaceRaster(rasterKey, setFlattenedArtwork);
-  }, [flattenedArtwork, rasterKey]);
-
-  useEffect(() => {
-    if (!artwork || flattenedArtwork || pendingSurfaceRasterCaptures.has(rasterKey)) return;
-    pendingSurfaceRasterCaptures.add(rasterKey);
-    let cancelled = false;
-    let firstFrame = 0;
-    let secondFrame = 0;
-    const generationAtStart = surfaceArtworkGenerations.get(artworkSurfaceId) ?? 0;
-    // Let Skia paint the full face once, then retain a single image for every
-    // later placement and drag. The source strokes remain editable in SQLite.
-    firstFrame = requestAnimationFrame(() => {
-      secondFrame = requestAnimationFrame(() => {
-        void canvasRef.current?.makeImageSnapshotAsync().then((image) => {
-          if (cancelled || (surfaceArtworkGenerations.get(artworkSurfaceId) ?? 0) !== generationAtStart) return;
-          cacheSurfaceRaster(rasterKey, image);
-          const pngBytes = image.encodeToBytes(ImageFormat.PNG);
-          void db.runAsync(
-            `INSERT INTO surface_artwork_rasters
-              (surface_id, variant, png_data, pixel_width, pixel_height, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(surface_id, variant) DO UPDATE SET
-               png_data = excluded.png_data,
-               pixel_width = excluded.pixel_width,
-               pixel_height = excluded.pixel_height,
-               updated_at = excluded.updated_at`,
-            artworkSurfaceId,
-            rasterVariant,
-            pngBytes,
-            image.width(),
-            image.height(),
-            Date.now()
-          ).catch((error) => console.warn('Could not save cached surface artwork:', artworkSurfaceId, error));
-          setFlattenedArtwork(image);
-          setArtwork(null);
-        }).catch(() => {
-          // If the platform cannot snapshot this frame, keep drawing the live
-          // Skia scene. The next mount can retry without affecting editing.
-        }).finally(() => pendingSurfaceRasterCaptures.delete(rasterKey));
-      });
+    setFlattened((current) => current.key === rasterKey ? current : { key: rasterKey, image: null });
+    void loadSurfaceRaster(db, rasterSpec).then((image) => {
+      if (!cancelled && image) setFlattened({ key: rasterKey, image });
     });
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(firstFrame);
-      cancelAnimationFrame(secondFrame);
-      pendingSurfaceRasterCaptures.delete(rasterKey);
-    };
-  }, [artwork, artworkSurfaceId, canvasRef, db, flattenedArtwork, rasterKey, rasterVariant]);
+    return () => { cancelled = true; };
+  }, [artworkRevision, db, rasterKey, rasterSpec]);
 
-  const pixelScale = width / tile.widthInches;
-  const tileShapePath = useMemo(() => {
-    const path = Skia.PathBuilder.Make();
-    if (tile.shape === 'circle') {
-      path.addOval({ x: 0, y: 0, width, height });
-    } else if (tile.shape === 'square') {
-      path.addRect({ x: 0, y: 0, width, height });
-    } else {
-      const points = tile.shape === 'hexagon'
-        ? [
-            { x: width * 0.25, y: 0 }, { x: width * 0.75, y: 0 }, { x: width, y: height * 0.5 },
-            { x: width * 0.75, y: height }, { x: width * 0.25, y: height }, { x: 0, y: height * 0.5 },
-          ]
-        : [{ x: width * 0.5, y: 0 }, { x: width, y: height }, { x: 0, y: height }];
-      points.forEach((point, index) => {
-        if (index === 0) path.moveTo(point.x, point.y);
-        else path.lineTo(point.x, point.y);
-      });
-      path.close();
-    }
-    return path.build();
-  }, [height, tile.shape, width]);
-
-  // Decode the saved image bytes for Skia once. Keeping tile artwork in Skia
-  // lets the polygon mask clip it transparently instead of painting the board
-  // color into the corners (which could cover an adjacent tile underneath).
-  const decodedArtwork = useMemo(() => {
-    if (!artwork || flattenedArtwork) return null;
-    const cached = tileArtworkImageCache.get(artwork.images);
-    if (cached) return cached;
-    const decode = (base64Data: string) => {
-      try {
-        return Skia.Image.MakeImageFromEncoded(Skia.Data.fromBase64(base64Data));
-      } catch (error) {
-        console.warn('Could not decode tile artwork image:', error);
-        return null;
-      }
-    };
-    const decoded: DecodedTileArtwork = {
-      backgroundImage: artwork.backgroundImage ? decode(artwork.backgroundImage.base64Data) : null,
-      images: artwork.images.map((image) => ({ ...image, decoded: decode(image.base64Data) })),
-    };
-    tileArtworkImageCache.set(artwork.images, decoded);
-    return decoded;
-  }, [artwork, flattenedArtwork]);
-  // Build saved paths once per artwork load instead of rebuilding all tile
-  // strokes whenever a neighboring piece or board control re-renders.
-  const artworkStrokePaths = useMemo(
-    () => {
-       if (!artwork || flattenedArtwork) return [];
-      const cached = tileArtworkPathCache.get(artwork.strokes);
-      if (cached) return cached;
-      const paths = artwork.strokes.map((stroke) => pointsToPath(stroke.points));
-      tileArtworkPathCache.set(artwork.strokes, paths);
-      return paths;
-    },
-    [artwork?.strokes, flattenedArtwork]
+  const flattenedArtwork = flattened.key === rasterKey ? flattened.image : null;
+  const tileShapePath = useMemo(
+    () => makeTileShapePath(tile.shape, width, height),
+    [height, tile.shape, width]
   );
 
   const outlineColor = selected ? '#315EFB' : '#4B5563';
@@ -291,57 +183,17 @@ export const BoardTileArtworkPreview = memo(function BoardTileArtworkPreview({
       height,
       backgroundColor: 'transparent',
     }}>
-      <Canvas ref={canvasRef} style={StyleSheet.absoluteFill}>
+      <Canvas style={StyleSheet.absoluteFill}>
         {flattenedArtwork ? (
           <SkiaImage image={flattenedArtwork} x={0} y={0} width={width} height={height} fit="fill" />
         ) : (
-          <Mask mask={<Path path={tileShapePath} color="#FFFFFF" />} mode="alpha">
-            <Group>
-              <Rect x={0} y={0} width={width} height={height} color={artwork?.backgroundColor ?? tile.color} />
-              {decodedArtwork?.backgroundImage && (
-                <SkiaImage
-                  image={decodedArtwork.backgroundImage}
-                  x={0}
-                  y={0}
-                  width={width}
-                  height={height}
-                  fit="cover"
-                />
-              )}
-              <Group transform={[{ scale: pixelScale }]}>
-                {artwork?.strokes.map((stroke, index) => !drawErasers && stroke.eraser ? null : (
-                  <Path
-                    key={`board-tile-stroke-${tile.id}-${index}`}
-                    path={artworkStrokePaths[index]}
-                    color={stroke.color}
-                    style="stroke"
-                    strokeWidth={stroke.width}
-                    strokeCap="round"
-                    strokeJoin="round"
-                    blendMode={stroke.eraser ? 'clear' : 'srcOver'}
-                  />
-                ))}
-              </Group>
-              {decodedArtwork?.images.map((image) => image.decoded && (
-                <SkiaImage
-                  key={`board-tile-image-${image.id}`}
-                  image={image.decoded}
-                  x={(image.center.x - image.width / 2) * pixelScale}
-                  y={(image.center.y - image.height / 2) * pixelScale}
-                  width={image.width * pixelScale}
-                  height={image.height * pixelScale}
-                  fit="contain"
-                />
-              ))}
-            </Group>
-          </Mask>
+          // Plain face while the artwork loads.
+          <Path path={tileShapePath} color={tile.color} />
+        )}
+        {showOutline && (
+          <Path path={tileShapePath} color={outlineColor} style="stroke" strokeWidth={selected ? 2.5 : 1.5} />
         )}
       </Canvas>
-      {showOutline && (
-        <Canvas pointerEvents="none" style={StyleSheet.absoluteFill}>
-          <Path path={tileShapePath} color={outlineColor} style="stroke" strokeWidth={selected ? 2.5 : 1.5} />
-        </Canvas>
-      )}
     </View>
   );
 });

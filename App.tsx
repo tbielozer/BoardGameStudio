@@ -11,6 +11,7 @@ import { TokenEditor } from './TokenEditor';
 import { DiceEditor } from './DiceEditor';
 import { GameplayPanel, type GameplayPanelHandle } from './GameplayPanel';
 import { styles } from './styles';
+import { SURFACE_RASTER_FORMAT } from './surfaceArtworkCache';
 
 // This file is the main screen for the app.
 // It controls which screen the user sees, manages custom symbols, and creates the
@@ -777,6 +778,13 @@ async function initializeDatabase(db: SQLiteDatabase) {
     CREATE INDEX IF NOT EXISTS idx_surface_images_surface_order
       ON surface_images(surface_id, order_index);
   `);
+
+  // Earlier versions saved on-screen snapshots here, which could be blank on
+  // iOS/Android. Drop them so every face is re-rendered by the current code.
+  await db.runAsync(
+    "DELETE FROM surface_artwork_rasters WHERE variant NOT LIKE ? || '|%'",
+    SURFACE_RASTER_FORMAT
+  );
 }
 export default function App() {
   return (
@@ -857,6 +865,11 @@ function AppContent() {
   const [chosenDeckSpotDeckId, setChosenDeckSpotDeckId] = useState<number | null>(null);
   const [isPlacingTileSnapPoint, setIsPlacingTileSnapPoint] = useState(false);
   const [tilePlacementMode, setTilePlacementMode] = useState<'tile' | 'deck' | null>(null);
+  // Keep the picker's last mode while its fade-out runs, so the closing dialog
+  // doesn't flash the other picker's title with an empty list.
+  const lastTilePlacementModeRef = useRef<'tile' | 'deck'>('tile');
+  if (tilePlacementMode) lastTilePlacementModeRef.current = tilePlacementMode;
+  const shownTilePlacementMode = tilePlacementMode ?? lastTilePlacementModeRef.current;
   const [tilePlacementOptions, setTilePlacementOptions] = useState<TileVisualOption[]>([]);
   const [diePlacementOptions, setDiePlacementOptions] = useState<DiePlacementOption[]>([]);
   const [diePlacementPickerOpen, setDiePlacementPickerOpen] = useState(false);
@@ -1604,8 +1617,8 @@ function AppContent() {
         >
           <View style={styles.renameBackdrop}>
             <View style={styles.renameDialog}>
-              <Text style={styles.menuTitle}>{tilePlacementMode === 'tile' ? 'Choose a Tile' : 'Choose a Tile Deck'}</Text>
-              {tilePlacementMode === 'tile' && (tilePlacementOptions.length === 0 ? (
+              <Text style={styles.menuTitle}>{shownTilePlacementMode === 'tile' ? 'Choose a Tile' : 'Choose a Tile Deck'}</Text>
+              {shownTilePlacementMode === 'tile' && (tilePlacementOptions.length === 0 ? (
                 <Text style={styles.spotSetupHelperText}>Create tile types in Tile Editor before placing them.</Text>
               ) : <ScrollView style={{ maxHeight: 360 }} keyboardShouldPersistTaps="handled">
                 {tilePlacementOptions.map((tile) => (
@@ -1614,7 +1627,7 @@ function AppContent() {
                   </Pressable>
                 ))}
               </ScrollView>)}
-              {tilePlacementMode === 'deck' && (tileDeckPlacementOptions.length === 0 ? (
+              {shownTilePlacementMode === 'deck' && (tileDeckPlacementOptions.length === 0 ? (
                 <Text style={styles.spotSetupHelperText}>Create tile decks in Tile Editor before placing them.</Text>
               ) : <ScrollView style={{ maxHeight: 360 }} keyboardShouldPersistTaps="handled">
                 {tileDeckPlacementOptions.map((deck) => (
