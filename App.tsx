@@ -555,21 +555,6 @@ async function initializeDatabase(db: SQLiteDatabase) {
 
   // These runtime tables are created in newer schemas. Add their columns to
   // databases that already had the simpler transform-and-return records.
-  // play_added marks pieces created by playing (taken from a deck or supply).
-  // The editor filters on it directly so Create Game never reads play tables.
-  for (const [table, stateTable] of [
-    ['tile_board_placements', 'gameplay_tile_placement_states'],
-    ['token_board_placements', 'gameplay_token_placement_states'],
-  ] as const) {
-    const columns = await db.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`);
-    if (!columns.some((column) => column.name === 'play_added')) {
-      await db.execAsync(`
-        ALTER TABLE ${table} ADD COLUMN play_added INTEGER NOT NULL DEFAULT 0;
-        UPDATE ${table} SET play_added = 1 WHERE id IN (
-          SELECT placement_id FROM ${stateTable} WHERE is_added = 1);
-      `);
-    }
-  }
   const gameplayTileStateColumns = await db.getAllAsync<{ name: string }>(
     'PRAGMA table_info(gameplay_tile_placement_states)'
   );
@@ -581,6 +566,22 @@ async function initializeDatabase(db: SQLiteDatabase) {
   );
   if (!gameplayTokenStateColumns.some((column) => column.name === 'is_added')) {
     await db.execAsync('ALTER TABLE gameplay_token_placement_states ADD COLUMN is_added INTEGER NOT NULL DEFAULT 0');
+  }
+  // play_added marks pieces created by playing (taken from a deck or supply).
+  // The editor filters on it directly so Create Game never reads play tables.
+  for (const [table, stateTable] of [
+    ['tile_board_placements', 'gameplay_tile_placement_states'],
+    ['token_board_placements', 'gameplay_token_placement_states'],
+  ] as const) {
+    const columns = await db.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`);
+    if (!columns.some((column) => column.name === 'play_added')) {
+      await db.execAsync(`ALTER TABLE ${table} ADD COLUMN play_added INTEGER NOT NULL DEFAULT 0`);
+    }
+    // Idempotent backfill (needs state.is_added, migrated above). Safe to rerun,
+    // which also repairs a database where an earlier launch added the column
+    // but failed before backfilling.
+    await db.execAsync(`UPDATE ${table} SET play_added = 1 WHERE play_added = 0 AND id IN (
+      SELECT placement_id FROM ${stateTable} WHERE is_added = 1)`);
   }
 
   // Existing token libraries only had a front. Add a separate back surface
