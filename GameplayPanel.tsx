@@ -672,8 +672,8 @@ export const GameplayPanel = forwardRef<GameplayPanelHandle, GameplayPanelProps>
 
         for (const tile of keep(snapshot.addedTiles, (item) => tileIds.has(item.tile_id))) {
           const result = await txn.runAsync(
-            `INSERT INTO tile_board_placements (surface_id, tile_id, deck_id, x, y, orientation, face_up)
-             VALUES (?, ?, NULL, ?, ?, ?, ?)`,
+            `INSERT INTO tile_board_placements (surface_id, tile_id, deck_id, x, y, orientation, face_up, play_added)
+             VALUES (?, ?, NULL, ?, ?, ?, ?, 1)`,
             boardSurfaceId, tile.tile_id, tile.x, tile.y, tile.orientation, tile.face_up
           );
           await txn.runAsync(
@@ -687,8 +687,8 @@ export const GameplayPanel = forwardRef<GameplayPanelHandle, GameplayPanelProps>
         }
         for (const token of keep(snapshot.addedTokens, (item) => tokenIds.has(item.token_id))) {
           const result = await txn.runAsync(
-            `INSERT INTO token_board_placements (surface_id, token_id, x, y, orientation, face_up)
-             VALUES (?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO token_board_placements (surface_id, token_id, x, y, orientation, face_up, play_added)
+             VALUES (?, ?, ?, ?, ?, ?, 1)`,
             boardSurfaceId, token.token_id, token.x, token.y, token.orientation, token.face_up
           );
           await txn.runAsync(

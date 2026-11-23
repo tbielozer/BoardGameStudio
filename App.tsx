@@ -117,7 +117,7 @@ async function initializeDatabase(db: SQLiteDatabase) {
   // Connection settings must run outside any transaction. Web uses wa-sqlite,
   // which does not support WAL.
   if (Platform.OS !== 'web') {
-    await db.execAsync('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
+    await db.execAsync('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;');
   }
   await db.execAsync(`
     PRAGMA foreign_keys = ON;
@@ -293,6 +293,7 @@ async function initializeDatabase(db: SQLiteDatabase) {
       y REAL NOT NULL,
       orientation REAL NOT NULL DEFAULT 0,
       face_up INTEGER NOT NULL DEFAULT 1,
+      play_added INTEGER NOT NULL DEFAULT 0,
       FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE,
       FOREIGN KEY (token_id) REFERENCES game_tokens(id) ON DELETE CASCADE
     );
@@ -379,6 +380,7 @@ async function initializeDatabase(db: SQLiteDatabase) {
       y REAL NOT NULL,
       orientation REAL NOT NULL DEFAULT 0,
       face_up INTEGER NOT NULL DEFAULT 1,
+      play_added INTEGER NOT NULL DEFAULT 0,
       CHECK ((tile_id IS NOT NULL AND deck_id IS NULL) OR (tile_id IS NULL AND deck_id IS NOT NULL)),
       FOREIGN KEY (surface_id) REFERENCES drawing_surfaces(id) ON DELETE CASCADE,
       FOREIGN KEY (tile_id) REFERENCES game_tiles(id) ON DELETE CASCADE,
@@ -553,6 +555,21 @@ async function initializeDatabase(db: SQLiteDatabase) {
 
   // These runtime tables are created in newer schemas. Add their columns to
   // databases that already had the simpler transform-and-return records.
+  // play_added marks pieces created by playing (taken from a deck or supply).
+  // The editor filters on it directly so Create Game never reads play tables.
+  for (const [table, stateTable] of [
+    ['tile_board_placements', 'gameplay_tile_placement_states'],
+    ['token_board_placements', 'gameplay_token_placement_states'],
+  ] as const) {
+    const columns = await db.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`);
+    if (!columns.some((column) => column.name === 'play_added')) {
+      await db.execAsync(`
+        ALTER TABLE ${table} ADD COLUMN play_added INTEGER NOT NULL DEFAULT 0;
+        UPDATE ${table} SET play_added = 1 WHERE id IN (
+          SELECT placement_id FROM ${stateTable} WHERE is_added = 1);
+      `);
+    }
+  }
   const gameplayTileStateColumns = await db.getAllAsync<{ name: string }>(
     'PRAGMA table_info(gameplay_tile_placement_states)'
   );

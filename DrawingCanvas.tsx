@@ -602,7 +602,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
            JOIN game_tokens AS token ON token.id = placement.token_id
            WHERE placement.surface_id = ?
              AND (? = 0 OR COALESCE(state.is_returned, 0) = 0)
-             AND (? = 1 OR COALESCE(state.is_added, 0) = 0)
+             AND (? = 1 OR placement.play_added = 0)
            ORDER BY placement.id`,
           gameplayMode ? 1 : 0,
           gameplayMode ? 1 : 0,
@@ -759,7 +759,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           )
           WHERE placement.surface_id = ?
             AND (? = 0 OR COALESCE(state.is_returned, 0) = 0)
-            AND (? = 1 OR COALESCE(state.is_added, 0) = 0)
+            AND (? = 1 OR placement.play_added = 0)
           ORDER BY placement.id`,
           gameplayMode ? 1 : 0,
           gameplayMode ? 1 : 0,
@@ -1464,8 +1464,8 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           throw new Error('This token supply is empty.');
         }
         const result = await db.runAsync(
-          `INSERT INTO token_board_placements (surface_id, token_id, x, y, orientation, face_up)
-           VALUES (?, ?, ?, ?, 0, 1)`,
+          `INSERT INTO token_board_placements (surface_id, token_id, x, y, orientation, face_up, play_added)
+           VALUES (?, ?, ?, ?, 0, 1, 1)`,
           surfaceId, supply.token.id, point.x, point.y
         );
         const id = result.lastInsertRowId;
@@ -1551,8 +1551,8 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           backSurfaceId: tileRow.back_surface_id,
         };
         const result = await txn.runAsync(
-          `INSERT INTO tile_board_placements (surface_id, tile_id, deck_id, x, y, orientation, face_up)
-           VALUES (?, ?, NULL, ?, ?, ?, 1)`,
+          `INSERT INTO tile_board_placements (surface_id, tile_id, deck_id, x, y, orientation, face_up, play_added)
+           VALUES (?, ?, NULL, ?, ?, ?, 1, 1)`,
           surfaceId, tileRow.id, placeAt.x, placeAt.y, orientation
         );
         placementResult.value = result.lastInsertRowId;
