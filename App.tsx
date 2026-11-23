@@ -27,6 +27,7 @@ import { styles } from './styles';
 type AppScreen = 
   'home' 
   | 'createGame' 
+  | 'playGame'
   | 'symbolLibrary'
   | 'symbolEditor'
   | 'cardEditor'
@@ -818,7 +819,9 @@ function AppContent() {
   // setScreen is the function used to change the page.
   const [screen, setScreen] = useState<AppScreen>('home');
   const [projectPickerMode, setProjectPickerMode] = useState<'create' | 'play'>('create');
-  const [isPlaying, setIsPlaying] = useState(false);
+  // Gameplay mode comes from the active screen so the editor and game cannot
+  // disagree about which state they are allowed to load or save.
+  const isPlaying = screen === 'playGame';
   const [gameplayDrawFaceUp, setGameplayDrawFaceUp] = useState(false);
   const [handCardDropRequest, setHandCardDropRequest] = useState<{
     requestId: number; cardInstanceId: number; absoluteX: number; absoluteY: number;
@@ -1378,11 +1381,8 @@ function AppContent() {
                       setTokenSupplySetupStep(null);
                       setPendingTokenSupply(null);
                       setPendingBoardToken(null);
-                      setIsPlaying(true);
-                    } else {
-                      setIsPlaying(false);
                     }
-                    setScreen('createGame');
+                    setScreen(projectPickerMode === 'play' ? 'playGame' : 'createGame');
                   }}
                 >
                   <Text style={styles.projectTileText}>{projectPickerMode === 'play' ? `Play ${project.name}` : project.name}</Text>
@@ -1489,13 +1489,11 @@ function AppContent() {
     );
   }
 
-  // This if statement decides which screen layout to show.
-  // The board-based screens reuse the same base mat background, while home uses a
-  // simpler landing screen. This keeps the game area consistent even when the user
-  // opens the symbol editor or menu overlay.
-  // If the user is on the create-game page or on either symbol page, we show the
-  // game mat background and overlay panels instead of the main menu.
-  if (screen === 'createGame' || isSymbolPage || screen === 'cardEditor' || screen === 'tileEditor' || screen === 'tokenEditor' || screen === 'diceEditor') {
+  // Create and play are separate app screens. They share the board canvas so a
+  // play session can load the editor's saved setup, but only createGame shows
+  // the piece-building menu and setup controls. Gameplay changes are stored in
+  // gameplay state and never become edits to the saved setup.
+  if (screen === 'createGame' || screen === 'playGame' || isSymbolPage || screen === 'cardEditor' || screen === 'tileEditor' || screen === 'tokenEditor' || screen === 'diceEditor') {
     return (
       <View style={styles.gameCanvas}>
         <Modal
@@ -1785,7 +1783,6 @@ function AppContent() {
             drawFaceUp={gameplayDrawFaceUp}
             onDrawFaceUpChange={setGameplayDrawFaceUp}
             onClose={() => {
-              setIsPlaying(false);
               setHandCardDropRequest(null);
               setCreateMenuOpen(false);
               setIsEditingSymbols(false);

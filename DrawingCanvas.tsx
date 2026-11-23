@@ -582,6 +582,24 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     let cancelled = false;
     const loadBoardTokens = async () => {
       try {
+        const tokenPlacementStateJoin = gameplayMode
+          ? `LEFT JOIN gameplay_token_placement_states AS state
+               ON state.placement_id = placement.id AND state.project_id = ?`
+          : '';
+        const tokenPositionX = gameplayMode ? 'COALESCE(state.x, placement.x)' : 'placement.x';
+        const tokenPositionY = gameplayMode ? 'COALESCE(state.y, placement.y)' : 'placement.y';
+        const tokenOrientation = gameplayMode
+          ? 'COALESCE(state.orientation, placement.orientation)'
+          : 'placement.orientation';
+        const tokenFaceUp = gameplayMode ? 'COALESCE(state.face_up, placement.face_up)' : 'placement.face_up';
+        const gameplayTokenFilters = gameplayMode
+          // Added tokens belong to the active game and must remain visible in
+          // Play. Only hide tokens that have been returned to a supply.
+          ? `AND COALESCE(state.is_returned, 0) = 0`
+          : `AND NOT EXISTS (
+              SELECT 1 FROM gameplay_token_placement_states AS added
+              WHERE added.project_id = ? AND added.placement_id = placement.id AND added.is_added = 1
+            )`;
         const rows = await db.getAllAsync<{
           id: number; x: number; y: number; orientation: number; face_up: number;
           token_id: number; name: string; shape: BoardTileVisual['shape'];
@@ -589,29 +607,20 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           front_surface_id: string; back_surface_id: string | null;
         }>(
           `SELECT placement.id,
-            CASE WHEN ? = 1 THEN COALESCE(state.x, placement.x) ELSE placement.x END AS x,
-            CASE WHEN ? = 1 THEN COALESCE(state.y, placement.y) ELSE placement.y END AS y,
-            CASE WHEN ? = 1 THEN COALESCE(state.orientation, placement.orientation) ELSE placement.orientation END AS orientation,
-            CASE WHEN ? = 1 THEN COALESCE(state.face_up, placement.face_up) ELSE placement.face_up END AS face_up,
+            ${tokenPositionX} AS x, ${tokenPositionY} AS y,
+            ${tokenOrientation} AS orientation, ${tokenFaceUp} AS face_up,
             token.id AS token_id, token.name, token.shape, token.width_inches,
             token.height_inches, token.color, token.surface_id AS front_surface_id,
             token.back_surface_id
            FROM token_board_placements AS placement
-           LEFT JOIN gameplay_token_placement_states AS state
-            ON state.placement_id = placement.id AND state.project_id = ?
+           ${tokenPlacementStateJoin}
            JOIN game_tokens AS token ON token.id = placement.token_id
            WHERE placement.surface_id = ?
-             AND (? = 0 OR COALESCE(state.is_returned, 0) = 0)
-             AND (? = 1 OR COALESCE(state.is_added, 0) = 0)
+             ${gameplayTokenFilters}
            ORDER BY placement.id`,
-          gameplayMode ? 1 : 0,
-          gameplayMode ? 1 : 0,
-          gameplayMode ? 1 : 0,
-          gameplayMode ? 1 : 0,
-          surfaceId.replace(/-board$/, ''),
-          surfaceId,
-          gameplayMode ? 1 : 0,
-          gameplayMode ? 1 : 0
+          ...(gameplayMode
+            ? [surfaceId.replace(/-board$/, ''), surfaceId]
+            : [surfaceId, surfaceId.replace(/-board$/, '')])
         );
         if (!cancelled) setBoardTokenPlacements(rows.map((row) => ({
           id: row.id,
@@ -662,8 +671,9 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
              ON game_state.project_id = ? AND game_state.placement_id = placement.id
            WHERE placement.surface_id = ? ORDER BY placement.id`,
           gameplayMode ? 1 : 0,
-          surfaceId.replace(/-board$/, ''),
-          surfaceId
+          ...(gameplayMode
+            ? [surfaceId.replace(/-board$/, ''), surfaceId]
+            : [surfaceId, surfaceId.replace(/-board$/, '')])
         );
         const faces = await db.getAllAsync<{ die_id: number; side_number: number; surface_id: string }>(
           `SELECT face.die_id, face.side_number, face.surface_id
@@ -709,6 +719,44 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     let cancelled = false;
     const loadTilePlacements = async () => {
       try {
+        // The create screen reads only the saved setup tables. Gameplay joins
+        // its own per-project state solely while the play screen is active.
+        const tilePlacementStateJoin = gameplayMode
+          ? `LEFT JOIN gameplay_tile_placement_states AS state
+               ON state.placement_id = placement.id AND state.project_id = ?`
+          : '';
+        const tilePositionX = gameplayMode ? 'COALESCE(state.x, placement.x)' : 'placement.x';
+        const tilePositionY = gameplayMode ? 'COALESCE(state.y, placement.y)' : 'placement.y';
+        const tileOrientation = gameplayMode
+          ? 'COALESCE(state.orientation, placement.orientation)'
+          : 'placement.orientation';
+        const tileFaceUp = gameplayMode ? 'COALESCE(state.face_up, placement.face_up)' : 'placement.face_up';
+        const tileCount = gameplayMode
+          ? `COALESCE((SELECT SUM(item.quantity) FROM tile_deck_items AS item
+                WHERE item.deck_id = placement.deck_id), 0) +
+              COALESCE((SELECT SUM(returned.quantity) FROM gameplay_tile_deck_returns AS returned
+                WHERE returned.deck_id = placement.deck_id AND returned.project_id = deck.project_id), 0) -
+              COALESCE((SELECT SUM(taken.quantity) FROM gameplay_tile_deck_takes AS taken
+                WHERE taken.deck_id = placement.deck_id AND taken.project_id = deck.project_id), 0)`
+          : `COALESCE((SELECT SUM(item.quantity) FROM tile_deck_items AS item
+                WHERE item.deck_id = placement.deck_id), 0)`;
+        const availableTopTile = gameplayMode
+          ? `item.quantity +
+              COALESCE((SELECT SUM(returned.quantity) FROM gameplay_tile_deck_returns AS returned
+                WHERE returned.project_id = deck.project_id AND returned.deck_id = item.deck_id
+                  AND returned.tile_id = item.tile_id), 0) -
+              COALESCE((SELECT SUM(taken.quantity) FROM gameplay_tile_deck_takes AS taken
+                WHERE taken.project_id = deck.project_id AND taken.deck_id = item.deck_id
+                  AND taken.tile_id = item.tile_id), 0) > 0`
+          : 'item.quantity > 0';
+        const gameplayTileFilters = gameplayMode
+          // A tile drawn from a deck is marked is_added in runtime state; it
+          // is still a real piece in Play, so only returned tiles are hidden.
+          ? `AND COALESCE(state.is_returned, 0) = 0`
+          : `AND NOT EXISTS (
+              SELECT 1 FROM gameplay_tile_placement_states AS added
+              WHERE added.project_id = ? AND added.placement_id = placement.id AND added.is_added = 1
+            )`;
         const rows = await db.getAllAsync<{
           id: number; x: number; y: number; orientation: number; face_up: number;
           tile_id: number | null; deck_id: number | null; deck_name: string | null;
@@ -718,20 +766,10 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
           back_surface_id: string | null;
         }>(
           `SELECT placement.id,
-            CASE WHEN ? = 1 THEN COALESCE(state.x, placement.x) ELSE placement.x END AS x,
-            CASE WHEN ? = 1 THEN COALESCE(state.y, placement.y) ELSE placement.y END AS y,
-            CASE WHEN ? = 1 THEN COALESCE(state.orientation, placement.orientation) ELSE placement.orientation END AS orientation,
-            CASE WHEN ? = 1 THEN COALESCE(state.face_up, placement.face_up) ELSE placement.face_up END AS face_up,
+            ${tilePositionX} AS x, ${tilePositionY} AS y,
+            ${tileOrientation} AS orientation, ${tileFaceUp} AS face_up,
             placement.tile_id, placement.deck_id, deck.name AS deck_name,
-            CASE WHEN ? = 1 THEN
-              COALESCE((SELECT SUM(item.quantity) FROM tile_deck_items AS item
-                WHERE item.deck_id = placement.deck_id), 0) +
-              COALESCE((SELECT SUM(returned.quantity) FROM gameplay_tile_deck_returns AS returned
-                WHERE returned.deck_id = placement.deck_id AND returned.project_id = deck.project_id), 0) -
-              COALESCE((SELECT SUM(taken.quantity) FROM gameplay_tile_deck_takes AS taken
-                WHERE taken.deck_id = placement.deck_id AND taken.project_id = deck.project_id), 0)
-            ELSE COALESCE((SELECT SUM(item.quantity) FROM tile_deck_items AS item
-                WHERE item.deck_id = placement.deck_id), 0) END AS tile_count,
+            ${tileCount} AS tile_count,
             COALESCE(tile.id, top_tile.id) AS visual_tile_id,
             COALESCE(tile.name, top_tile.name) AS tile_name,
             COALESCE(tile.shape, top_tile.shape) AS tile_shape,
@@ -741,36 +779,20 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
             COALESCE(tile.surface_id, top_tile.surface_id) AS front_surface_id,
             COALESCE(tile.back_surface_id, top_tile.back_surface_id) AS back_surface_id
           FROM tile_board_placements AS placement
-          LEFT JOIN gameplay_tile_placement_states AS state
-            ON state.placement_id = placement.id AND state.project_id = ?
+          ${tilePlacementStateJoin}
           LEFT JOIN game_tiles AS tile ON tile.id = placement.tile_id
           LEFT JOIN tile_decks AS deck ON deck.id = placement.deck_id
           LEFT JOIN game_tiles AS top_tile ON top_tile.id = (
             SELECT item.tile_id FROM tile_deck_items AS item
-            WHERE item.deck_id = placement.deck_id AND item.quantity + CASE WHEN ? = 1 THEN
-              COALESCE((SELECT SUM(returned.quantity) FROM gameplay_tile_deck_returns AS returned
-                WHERE returned.project_id = deck.project_id AND returned.deck_id = item.deck_id
-                  AND returned.tile_id = item.tile_id), 0) -
-              COALESCE((SELECT SUM(taken.quantity) FROM gameplay_tile_deck_takes AS taken
-                WHERE taken.project_id = deck.project_id AND taken.deck_id = item.deck_id
-                  AND taken.tile_id = item.tile_id), 0)
-              ELSE 0 END > 0
+            WHERE item.deck_id = placement.deck_id AND ${availableTopTile}
             ORDER BY item.tile_id LIMIT 1
           )
           WHERE placement.surface_id = ?
-            AND (? = 0 OR COALESCE(state.is_returned, 0) = 0)
-            AND (? = 1 OR COALESCE(state.is_added, 0) = 0)
+            ${gameplayTileFilters}
           ORDER BY placement.id`,
-          gameplayMode ? 1 : 0,
-          gameplayMode ? 1 : 0,
-          gameplayMode ? 1 : 0,
-          gameplayMode ? 1 : 0,
-          gameplayMode ? 1 : 0,
-          gameplayMode ? 1 : 0,
-          surfaceId.replace(/-board$/, ''),
-          surfaceId,
-          gameplayMode ? 1 : 0,
-          gameplayMode ? 1 : 0
+          ...(gameplayMode
+            ? [surfaceId.replace(/-board$/, ''), surfaceId]
+            : [surfaceId, surfaceId.replace(/-board$/, '')])
         );
         if (!cancelled) {
           setBoardTilePlacements(rows.map((row) => ({
@@ -1630,15 +1652,18 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
 
   const queueTokenMarkerSave = useCallback((session: TokenMarkerDragSession) => {
     if (surfaceId === undefined) return;
+    // A gesture can finish as the board is transitioning screens. Never let a
+    // drag that began in play mode fall through to a setup-table UPDATE.
+    const saveAsGameplayState = gameplayMode || session.gameplayMode;
     enqueueDatabaseAction(async () => {
       if (session.kind === 'supply') {
-        if (gameplayMode) return;
+        if (saveAsGameplayState) return;
         await db.runAsync(
           'UPDATE token_supply_placements SET x = ?, y = ? WHERE id = ? AND surface_id = ?',
           session.updatedX, session.updatedY, session.id, surfaceId
         );
       } else if (session.kind === 'token') {
-        if (gameplayMode) {
+        if (saveAsGameplayState) {
           const token = boardTokenPlacements.find((item) => item.id === session.id);
           if (!token) return;
           await db.runAsync(
@@ -1656,7 +1681,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
             session.updatedX, session.updatedY, session.id, surfaceId
           );
         }
-      } else if (!gameplayMode) {
+      } else if (!saveAsGameplayState) {
         // Dice stay where the creator put them during play; only rolls are saved.
         await db.runAsync(
           'UPDATE die_board_placements SET x = ?, y = ? WHERE id = ? AND surface_id = ?',
@@ -1702,7 +1727,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     } else if (session.kind === 'token') {
       setBoardTokenPlacements((current) => current.map((item) => item.id === session.id
         ? { ...item, x: session.updatedX, y: session.updatedY } : item));
-      if (gameplayMode) {
+      if (gameplayMode || session.gameplayMode) {
         pendingGameplayTokenTransformResetRef.current = {
           id: session.id,
           x: session.updatedX,
@@ -1887,8 +1912,11 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
     saveAsGameplayState = gameplayMode
   ) => {
     if (surfaceId === undefined) return;
+    // If the canvas has already entered gameplay, always persist to its runtime
+    // state even if a gesture's captured mode was stale during a transition.
+    const shouldSaveGameplayState = gameplayMode || saveAsGameplayState;
     enqueueDatabaseAction(async () => {
-      if (saveAsGameplayState) {
+      if (shouldSaveGameplayState) {
         await db.runAsync(
           `INSERT INTO gameplay_tile_placement_states
             (project_id, placement_id, x, y, orientation, face_up)
@@ -2686,7 +2714,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         activePieceRotation.value = token.orientation;
         gameplayPieceDragKind.value = 2;
         tokenMarkerDragSessionRef.current = {
-          kind: 'token', id: token.id, startPoint: point,
+          kind: 'token', id: token.id, gameplayMode, startPoint: point,
           startX: token.x, startY: token.y, updatedX: token.x, updatedY: token.y, changed: false,
         };
         return;
@@ -2943,7 +2971,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         symbolDragSessionRef.current = null;
         const base = boardDiePlacements.find((item) => item.id === dieHit.id)!;
         tokenMarkerDragSessionRef.current = {
-          kind: 'die', id: base.id, startPoint: point,
+          kind: 'die', id: base.id, gameplayMode, startPoint: point,
           startX: base.x, startY: base.y, updatedX: base.x, updatedY: base.y, changed: false,
         };
         return;
@@ -2969,7 +2997,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         symbolDragSessionRef.current = null;
         const base = boardTokenPlacements.find((item) => item.id === tokenHit.id)!;
         tokenMarkerDragSessionRef.current = {
-          kind: 'token', id: base.id, startPoint: point,
+          kind: 'token', id: base.id, gameplayMode, startPoint: point,
           startX: base.x, startY: base.y, updatedX: base.x, updatedY: base.y, changed: false,
         };
         return;
@@ -2995,7 +3023,7 @@ export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>
         symbolDragSessionRef.current = null;
         const base = tokenSupplyPlacements.find((item) => item.id === supplyHit.id)!;
         tokenMarkerDragSessionRef.current = {
-          kind: 'supply', id: base.id, startPoint: point,
+          kind: 'supply', id: base.id, gameplayMode, startPoint: point,
           startX: base.x, startY: base.y, updatedX: base.x, updatedY: base.y, changed: false,
         };
         return;

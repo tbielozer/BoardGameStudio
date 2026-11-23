@@ -132,6 +132,8 @@ export type BoardDiePlacement = {
 export type TokenMarkerDragSession = {
   kind: 'supply' | 'token' | 'die';
   id: number;
+  /** Keep the write destination tied to the screen where this drag began. */
+  gameplayMode: boolean;
   startPoint: Point;
   startX: number;
   startY: number;
